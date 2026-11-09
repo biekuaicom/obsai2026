@@ -109,8 +109,8 @@ try {
 
 # 6. 设置 remote（URL 不含 token），推送
 $remoteUrl = "https://github.com/$Owner/$Repo.git"
-$existingRemote = (& git remote get-url origin 2>$null)
-if ($LASTEXITCODE -eq 0) {
+$remotes = @(& git remote)
+if ($remotes -contains "origin") {
     & git remote set-url origin $remoteUrl
 } else {
     & git remote add origin $remoteUrl
