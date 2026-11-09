@@ -1,0 +1,31 @@
+# Python 虚拟环境：开源仓库不提交平台相关的 .venv
+.venv/
+venv/
+env/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 构建产物与本机运行产物
+build/
+dist/
+artifacts/
+*.spec.bak
+
+# 本机工程/日志/缓存
+demo_runtime/
+*.log
+*.pcbproj.json.bak
+.env
+.env.*
+*.token
+*.pem
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcb-ar-annotator"
+version = "0.2.1"
+description = "PCB microscope live AR annotation and verification desktop app"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "GPL-3.0-only" }
+authors = [{ name = "biekuaicom" }]
+dependencies = [
+  "PyQt6==6.9.1",
+  "opencv-python-headless==4.12.0.88",
+  "numpy==2.2.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.2", "pyinstaller==6.16.0"]
+
+[project.urls]
+Homepage = "https://github.com/biekuaicom/obsai2026"
+Repository = "https://github.com/biekuaicom/obsai2026"
+
+[project.scripts]
+pcb-ar = "pcb_ar.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pcb_ar = ["assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]
