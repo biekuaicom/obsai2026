@@ -58,6 +58,9 @@ class SparseKeyframe:
     neighbors: list[int] = field(default_factory=list)
     image_file: str = ""
     jpeg: bytes | None = None
+    red_area_ratio: float = 0.0
+    red_components: int = 0
+    red_hu: list[float] = field(default_factory=list)
 
     @property
     def point_count(self) -> int:
@@ -180,6 +183,9 @@ class SparseMap:
                     "pose": np.asarray(kf.pose, dtype=float).reshape(3, 3).tolist(),
                     "coverage": np.asarray(kf.coverage, dtype=float).reshape(-1, 2).tolist(),
                     "neighbors": [int(n) for n in kf.neighbors],
+                    "red_area_ratio": float(kf.red_area_ratio),
+                    "red_components": int(kf.red_components),
+                    "red_hu": [float(v) for v in kf.red_hu],
                     "image": f"{KEYFRAME_DIR}/{image_name}",
                 }
             )
@@ -241,6 +247,9 @@ class SparseMap:
                     global_descriptor=np.asarray(globals_all[idx], dtype=np.uint8),
                     neighbors=[int(n) for n in entry.get("neighbors", [])],
                     image_file=str(image_path),
+                    red_area_ratio=float(entry.get("red_area_ratio", 0.0)),
+                    red_components=int(entry.get("red_components", 0)),
+                    red_hu=[float(v) for v in entry.get("red_hu", [])],
                 )
             )
         return cls(

@@ -62,9 +62,84 @@ class SparseCaptureConfig:
     seam_min_cc: float = 0.18
     seam_max_shift_px: float = 24.0
     seam_max_rotation_deg: float = 2.5
+    red_area_growth_warn: float = 0.45
+    red_iou_warn: float = 0.35
+    red_shape_warn: float = 1.15
+    red_anomaly_frames: int = 2
     rectify_board: bool = True
     rectify_max_side: int = 3200
     rectify_max_pixels: int = 8_000_000
+
+
+@dataclass
+class RedMetrics:
+    """红区面积/外形记忆值，用于快速发现整块假红。"""
+
+    area_px: int = 0
+    area_fraction: float = 0.0
+    components: int = 0
+    largest_share: float = 0.0
+    bbox: tuple[int, int, int, int] = (0, 0, 0, 0)
+    centroid: tuple[float, float] = (0.0, 0.0)
+    extent: float = 0.0
+    solidity: float = 0.0
+    aspect: float = 0.0
+    hu: np.ndarray = field(default_factory=lambda: np.zeros(7, dtype=np.float64))
+
+    def shape_distance(self, other: "RedMetrics | None") -> float:
+        if other is None:
+            return 0.0
+        # log-Hu 对平移/缩放不敏感，适合做“外形值”记忆比较。
+        return float(np.mean(np.abs(self.hu - other.hu)))
+
+
+def compute_red_metrics(mask: np.ndarray) -> RedMetrics:
+    if mask is None or mask.size == 0:
+        return RedMetrics()
+    mask_u8 = (mask > 0).astype(np.uint8) * 255
+    h, w = mask_u8.shape[:2]
+    area = int(np.count_nonzero(mask_u8))
+    if area == 0:
+        return RedMetrics()
+    k = max(1, int(round(min(h, w) * 0.002)))
+    kernel = np.ones((k, k), np.uint8)
+    clean = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
+    if not np.any(clean):
+        clean = mask_u8
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(clean, connectivity=8)
+    comp_areas = [int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= 30]
+    largest = max(comp_areas) if comp_areas else area
+    contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return RedMetrics(area_px=area, area_fraction=area / float(h * w))
+    contour = max(contours, key=cv2.contourArea)
+    x, y, bw, bh = cv2.boundingRect(contour)
+    ys, xs = np.nonzero(clean)
+    gx0, gy0 = int(xs.min()), int(ys.min())
+    gw, gh = int(xs.max() - gx0 + 1), int(ys.max() - gy0 + 1)
+    extent = float(area) / float(max(1, gw * gh))
+    hull = cv2.convexHull(contour)
+    solidity = float(cv2.contourArea(contour)) / float(max(1.0, cv2.contourArea(hull)))
+    moments = cv2.moments(clean, binaryImage=True)
+    hu = cv2.HuMoments(moments).reshape(-1)
+    hu = -np.sign(hu) * np.log10(np.abs(hu) + 1e-12)
+    if moments["m00"] > 0:
+        cx = float(moments["m10"] / moments["m00"])
+        cy = float(moments["m01"] / moments["m00"])
+    else:
+        cx, cy = gx0 + gw / 2.0, gy0 + gh / 2.0
+    return RedMetrics(
+        area_px=area,
+        area_fraction=area / float(h * w),
+        components=len(comp_areas),
+        largest_share=largest / float(max(1, area)),
+        bbox=(gx0, gy0, gw, gh),
+        centroid=(cx, cy),
+        extent=extent,
+        solidity=solidity,
+        aspect=float(max(gw, gh)) / float(max(1, min(gw, gh))),
+        hu=hu,
+    )
 
 
 @dataclass
@@ -78,6 +153,12 @@ class CapturePreview:
     new_fraction: float = 1.0
     matches: int = 0
     inliers: int = 0
+    red_metrics: RedMetrics = field(default_factory=RedMetrics)
+    red_iou: float = 0.0
+    red_area_growth: float = 0.0
+    red_shape_distance: float = 0.0
+    red_anomaly: bool = False
+    red_warning: str = ""
     sharpness: float = 0.0
     motion_px: float = 999.0
     can_capture: bool = False
@@ -95,6 +176,7 @@ class CapturedKeyframe:
     global_descriptor: np.ndarray
     jpeg: bytes
     timestamp: float
+    red_metrics: RedMetrics | None = None
     matches: int = 0
     inliers: int = 0
     pose_source: int = -1
@@ -139,6 +221,14 @@ class SparseCaptureSession:
         self._canvas_scale = 1.0
         self._overview_version = 0
         self._merge_error = ""
+        self._prev_red_mask: np.ndarray | None = None
+        self._prev_red_pose: np.ndarray | None = None
+        self._prev_red_metrics: RedMetrics | None = None
+        self._capture_red_mask: np.ndarray | None = None
+        self._capture_red_pose: np.ndarray | None = None
+        self._capture_red_metrics: RedMetrics | None = None
+        self._red_anomaly_run = 0
+        self._red_memory: list[RedMetrics] = []
 
     @property
     def count(self) -> int:
@@ -168,6 +258,15 @@ class SparseCaptureSession:
     def seam_refined_count(self) -> int:
         return sum(1 for kf in self.keyframes if kf.seam_applied)
 
+    def _clear_red_guard(self) -> None:
+        self._prev_red_mask = None
+        self._prev_red_pose = None
+        self._prev_red_metrics = None
+        self._capture_red_mask = None
+        self._capture_red_pose = None
+        self._capture_red_metrics = None
+        self._red_anomaly_run = 0
+
     def reset(self) -> None:
         self.keyframes.clear()
         self._prev_stability_gray = None
@@ -182,6 +281,14 @@ class SparseCaptureSession:
         self._canvas_scale = 1.0
         self._overview_version = 0
         self._merge_error = ""
+        self._prev_red_mask = None
+        self._prev_red_pose = None
+        self._prev_red_metrics = None
+        self._capture_red_mask = None
+        self._capture_red_pose = None
+        self._capture_red_metrics = None
+        self._red_anomaly_run = 0
+        self._red_memory.clear()
 
     # ------------------------------------------------------------------ 稳定性
     def _stability(self, frame: np.ndarray) -> tuple[bool, float, float, float]:
@@ -223,6 +330,7 @@ class SparseCaptureSession:
             motion_px=motion,
         )
         if not self.keyframes:
+            self._clear_red_guard()
             preview.coverage_polygons = []
             preview.covered_fraction = 0.0
             preview.new_fraction = 1.0
@@ -245,6 +353,7 @@ class SparseCaptureSession:
             nfeatures=self.config.features,
         )
         if features.descriptors.size == 0:
+            self._clear_red_guard()
             preview.message = "特征不足，请对准丝印/焊盘/定位孔"
             preview.reason = "no_features"
             self._last_preview = preview
@@ -296,6 +405,7 @@ class SparseCaptureSession:
             best = (candidate, matrix_full, inliers, len(good))
             break
         if best is None:
+            self._clear_red_guard()
             preview.matches = best_good_count
             preview.message = (
                 f"与已拍区域匹配不足（匹配 {best_good_count}），请回退一点"
@@ -317,10 +427,11 @@ class SparseCaptureSession:
         )
         preview.coverage_polygons = coverage_polys
         preview.verified_keyframes = len(coverage_polys)
-        preview.covered_fraction = self._coverage_fraction(
-            coverage_polys, frame.shape[1], frame.shape[0]
-        )
+        red_mask = self._rasterize_coverage(coverage_polys, frame.shape[1], frame.shape[0])
+        preview.red_metrics = compute_red_metrics(red_mask)
+        preview.covered_fraction = preview.red_metrics.area_fraction
         preview.new_fraction = max(0.0, 1.0 - preview.covered_fraction)
+        self._evaluate_red_guard(preview, red_mask, pose_full)
         if preview.covered_fraction < self.config.min_overlap:
             preview.can_capture = False
             preview.message = (
@@ -346,6 +457,13 @@ class SparseCaptureSession:
                 f"内点 {inliers} · 新区域 {preview.new_fraction:.0%}"
             )
             preview.reason = "ready"
+        if preview.red_anomaly:
+            preview.can_capture = False
+            preview.message = (
+                f"红区面积/外形突变（{preview.red_warning}），疑似误识别；"
+                "请回退到上一张附近，稳定两帧再拍"
+            )
+            preview.reason = "red_anomaly"
         self._last_preview = preview
         return preview
 
@@ -447,15 +565,101 @@ class SparseCaptureSession:
         return dt <= 22.0 and da <= 4.0 and ds <= 0.08
 
     @staticmethod
-    def _coverage_fraction(polygons: list[np.ndarray], width: int, height: int) -> float:
-        if not polygons:
-            return 0.0
+    def _rasterize_coverage(polygons: list[np.ndarray], width: int, height: int) -> np.ndarray:
         mask = np.zeros((height, width), dtype=np.uint8)
         for poly in polygons:
             pts = np.round(poly).astype(np.int32)
             if pts.shape[0] >= 3:
                 cv2.fillPoly(mask, [pts], 255)
+        return mask
+
+    def _coverage_fraction(self, polygons: list[np.ndarray], width: int, height: int) -> float:
+        if not polygons:
+            return 0.0
+        mask = self._rasterize_coverage(polygons, width, height)
         return float(np.count_nonzero(mask)) / float(max(1, width * height))
+
+    def _evaluate_red_guard(
+        self,
+        preview: CapturePreview,
+        red_mask: np.ndarray,
+        pose_current: np.ndarray,
+    ) -> None:
+        """面积 + 外形记忆的快速 guard。
+
+        这是“体检”，不是唯一判据：面积合法变化（例如回到旧区域）可能被
+        短期标记，但必须连续多帧异常才禁用拍摄，避免误杀正常移动。
+        """
+        metrics = preview.red_metrics
+        # 优先与上一次“已接受拍摄”的红区记忆比较；这才是用户说的每拍一张记忆值。
+        if (
+            self._capture_red_metrics is not None
+            and self._capture_red_mask is not None
+            and self._capture_red_pose is not None
+            and self._capture_red_metrics.area_px > 0
+        ):
+            prev = self._capture_red_metrics
+            prev_mask = self._capture_red_mask
+            prev_pose = self._capture_red_pose
+        else:
+            prev = self._prev_red_metrics
+            prev_mask = self._prev_red_mask
+            prev_pose = self._prev_red_pose
+        if prev is not None and prev_mask is not None and prev_pose is not None and prev.area_px > 0:
+            try:
+                mapping = np.linalg.inv(as_homography(pose_current)) @ as_homography(prev_pose)
+                warped = cv2.warpAffine(
+                    prev_mask,
+                    mapping[:2, :].astype(np.float32),
+                    (red_mask.shape[1], red_mask.shape[0]),
+                    flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                inter = int(np.count_nonzero((warped > 0) & (red_mask > 0)))
+                union = int(np.count_nonzero((warped > 0) | (red_mask > 0)))
+                preview.red_iou = float(inter) / float(max(1, union))
+            except cv2.error:
+                preview.red_iou = 0.0
+            preview.red_area_growth = (
+                float(metrics.area_px - prev.area_px) / float(max(1, prev.area_px))
+            )
+            preview.red_shape_distance = metrics.shape_distance(prev)
+            anomaly = False
+            reasons: list[str] = []
+            if (
+                preview.red_area_growth > self.config.red_area_growth_warn
+                and preview.red_iou < self.config.red_iou_warn
+            ):
+                anomaly = True
+                reasons.append(f"面积{preview.red_area_growth:+.0%}")
+            if preview.red_area_growth > self.config.red_area_growth_warn * 1.8:
+                anomaly = True
+                reasons.append("面积突增")
+            if (
+                preview.red_shape_distance > self.config.red_shape_warn
+                and preview.red_area_growth > 0.20
+            ):
+                anomaly = True
+                reasons.append("外形突变")
+            if (
+                metrics.components > prev.components + 2
+                and metrics.largest_share < 0.55
+            ):
+                anomaly = True
+                reasons.append("红区碎裂")
+            if anomaly:
+                self._red_anomaly_run += 1
+                preview.red_warning = "，".join(reasons)
+            else:
+                self._red_anomaly_run = 0
+                preview.red_warning = ""
+            preview.red_anomaly = self._red_anomaly_run >= self.config.red_anomaly_frames
+        else:
+            self._red_anomaly_run = 0
+        self._prev_red_mask = red_mask.copy()
+        self._prev_red_pose = np.asarray(pose_current, dtype=np.float64).reshape(3, 3).copy()
+        self._prev_red_metrics = metrics
 
     # ------------------------------------------------------------------ 增量总览
     def _world_bounds(self) -> tuple[float, float, float, float] | None:
@@ -854,6 +1058,7 @@ class SparseCaptureSession:
             global_descriptor=features.global_descriptor,
             jpeg=buffer.tobytes(),
             timestamp=time.time(),
+            red_metrics=preview.red_metrics,
             matches=pose_matches,
             inliers=pose_inliers,
             pose_source=pose_source,
@@ -867,6 +1072,17 @@ class SparseCaptureSession:
         self._last_preview = None
         self._preview_frame = None
         self._stable_run = 0
+        self._red_memory.append(preview.red_metrics)
+        if preview.pose is not None and preview.red_metrics.area_px > 0:
+            mask = self._rasterize_coverage(
+                preview.coverage_polygons,
+                self._last_frame.shape[1] if self._last_frame is not None else 0,
+                self._last_frame.shape[0] if self._last_frame is not None else 0,
+            )
+            self._capture_red_mask = mask
+            self._capture_red_pose = np.asarray(preview.pose, dtype=np.float64).reshape(3, 3).copy()
+            self._capture_red_metrics = preview.red_metrics
+        self._red_anomaly_run = 0
         suffix = ""
         if record.seam_applied:
             suffix = f"；板边对齐 {record.seam_shift_px:.1f}px"
@@ -924,6 +1140,9 @@ class SparseCaptureSession:
                     global_descriptor=kf.global_descriptor,
                     neighbors=[n for n in (idx - 1, idx + 1) if 0 <= n < len(self.keyframes)],
                     jpeg=kf.jpeg,
+                    red_area_ratio=float(kf.red_metrics.area_fraction) if kf.red_metrics else 0.0,
+                    red_components=int(kf.red_metrics.components) if kf.red_metrics else 0,
+                    red_hu=[float(v) for v in kf.red_metrics.hu] if kf.red_metrics else [],
                 )
             )
         # 根据覆盖多边形相交关系补全邻居图

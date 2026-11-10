@@ -221,6 +221,10 @@ class GuidedCaptureDialog(QDialog):
         self.overlap_label = QLabel("已覆盖 —")
         self.overlap_label.setObjectName("Muted")
         card_layout.addWidget(self.overlap_label)
+        self.red_guard_label = QLabel("红区面积/外形：—")
+        self.red_guard_label.setObjectName("Muted")
+        self.red_guard_label.setWordWrap(True)
+        card_layout.addWidget(self.red_guard_label)
         self.quality_label = QLabel("稳定性：等待")
         self.quality_label.setObjectName("Muted")
         card_layout.addWidget(self.quality_label)
@@ -316,6 +320,8 @@ class GuidedCaptureDialog(QDialog):
         self._thumb_version = -1
         self.overview_label.setPixmap(QPixmap())
         self.overview_label.setText("每拍一张会立即并入这里")
+        self.red_guard_label.setText("红区面积/外形：—")
+        self.red_guard_label.setStyleSheet("color: #7C8FA5; font-size: 11px;")
         self._timer.start()
         self._update_buttons()
 
@@ -352,6 +358,24 @@ class GuidedCaptureDialog(QDialog):
             f"红色覆盖 {preview.covered_fraction:.0%} · 新区域 {preview.new_fraction:.0%} · "
             f"内点 {preview.inliers} · 已复核 {preview.verified_keyframes} 张"
         )
+        red = preview.red_metrics
+        if preview.red_anomaly:
+            state = "异常"
+            color = "#FF5F73"
+        elif preview.red_warning:
+            state = "波动"
+            color = "#F5A524"
+        else:
+            state = "稳定"
+            color = "#7C8FA5"
+        text = (
+            f"红区面积 {red.area_fraction:.0%} · 连通 {red.components} · "
+            f"外形 {state}"
+        )
+        if preview.red_warning:
+            text += f"（{preview.red_warning}）"
+        self.red_guard_label.setText(text)
+        self.red_guard_label.setStyleSheet(f"color: {color}; font-size: 11px;")
         self.metrics_label.setText(
             f"关键帧 {self.session.count} · 移动 {preview.motion_px:.1f}px · "
             f"匹配 {preview.matches}"
@@ -441,6 +465,10 @@ class GuidedCaptureDialog(QDialog):
         self._show_overview(result.overview)
         self.status_label.setText("稀疏关键帧地图与增量总览已生成")
         self.quality_label.setText("定位模式：稀疏关键帧默认 + 全图周期校验")
+        self.red_guard_label.setText(
+            f"红区记忆：{self.session.count} 张；面积/外形参数已写入稀疏地图"
+        )
+        self.red_guard_label.setStyleSheet("color: #7C8FA5; font-size: 11px;")
         self.overlap_label.setText(
             f"边缘对齐 {self.session.seam_refined_count} 张 · "
             f"{result.rectify_message or '板边未校正'}"

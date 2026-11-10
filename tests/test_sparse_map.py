@@ -54,6 +54,8 @@ def test_sparse_capture_result(sparse_bundle):
     assert loaded.board_width == result.overview.shape[1]
     assert loaded.board_height == result.overview.shape[0]
     assert all(k.coverage.shape == (4, 2) for k in loaded.keyframes)
+    assert any(k.red_area_ratio > 0 for k in loaded.keyframes)
+    assert all(len(k.red_hu) == 7 for k in loaded.keyframes)
 
 
 def test_sparse_localization_accuracy(board, sparse_bundle):
