@@ -41,6 +41,7 @@ class CapturePreviewWidget(QWidget):
         super().__init__(parent)
         self._frame: np.ndarray | None = None
         self._polygons: list[np.ndarray] = []
+        self._mask: np.ndarray | None = None
         self._status = "等待实时画面"
         self._can_capture = False
         self._show_legend = True
@@ -54,9 +55,11 @@ class CapturePreviewWidget(QWidget):
         status: str,
         can_capture: bool = False,
         show_legend: bool = True,
+        coverage_mask: np.ndarray | None = None,
     ) -> None:
         self._frame = frame
         self._polygons = polygons
+        self._mask = coverage_mask
         self._status = status
         self._can_capture = can_capture
         self._show_legend = show_legend
@@ -80,8 +83,27 @@ class CapturePreviewWidget(QWidget):
         image = qimage_from_bgr(frame)
         painter.drawImage(QRectF(x0, y0, draw_w, draw_h), image)
 
-        # 已覆盖区域：全部关键帧覆盖多边形的并集，整体只填充一次。
-        # 这样重叠处不会因为 alpha 叠加而变深，视觉上就是“全部已拍并集”。
+        # 已覆盖区域：优先使用板级 coverage mask 的 warp 结果。
+        # 这是 O(1) 叠加，不会随关键帧数量增加而做 QPainterPath 布尔并集。
+        if self._mask is not None and self._mask.size > 0:
+            mask = self._mask
+            if mask.shape[:2] != frame.shape[:2]:
+                mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+            rgba = np.zeros((mask.shape[0], mask.shape[1], 4), dtype=np.uint8)
+            rgba[mask > 0] = (255, 70, 90, 66)
+            edges = cv2.Canny((mask > 0).astype(np.uint8) * 255, 50, 150)
+            rgba[edges > 0] = (255, 82, 104, 230)
+            qimage = QImage(
+                rgba.data,
+                rgba.shape[1],
+                rgba.shape[0],
+                int(rgba.strides[0]),
+                QImage.Format.Format_RGBA8888,
+            ).copy()
+            painter.save()
+            painter.setClipRect(QRectF(x0, y0, draw_w, draw_h))
+            painter.drawImage(QRectF(x0, y0, draw_w, draw_h), qimage)
+            painter.restore()
         path = QPainterPath()
         path.setFillRule(Qt.FillRule.WindingFill)
         has_polygon = False
@@ -338,7 +360,13 @@ class GuidedCaptureDialog(QDialog):
             self.status_label.setText("没有实时画面，请先在主界面启动摄像头/演示")
             return
         preview = self.session.preview(frame)
-        self.preview.set_data(frame, preview.coverage_polygons, preview.message, preview.can_capture)
+        self.preview.set_data(
+            frame,
+            preview.coverage_polygons,
+            preview.message,
+            preview.can_capture,
+            coverage_mask=preview.coverage_mask,
+        )
         self._update_metrics(preview)
         self._refresh_overview_thumb()
         if (
@@ -361,9 +389,10 @@ class GuidedCaptureDialog(QDialog):
             f"稳定性：{'稳定' if preview.stable else '未稳定'} · "
             f"清晰度 {preview.sharpness:.0f}"
         )
+        local_text = "全图回退" if preview.global_fallback else "局部候选"
         self.overlap_label.setText(
             f"红色覆盖 {preview.covered_fraction:.0%} · 新区域 {preview.new_fraction:.0%} · "
-            f"内点 {preview.inliers} · 已复核 {preview.verified_keyframes} 张"
+            f"内点 {preview.inliers} · {local_text}"
         )
         red = preview.red_metrics
         if preview.red_anomaly:

@@ -155,6 +155,7 @@ class CapturePreview:
     message: str = "等待稳定画面…"
     pose: np.ndarray | None = None
     coverage_polygons: list[np.ndarray] = field(default_factory=list)
+    coverage_mask: np.ndarray | None = None
     verified_keyframes: int = 0
     covered_fraction: float = 0.0
     new_fraction: float = 1.0
@@ -166,6 +167,7 @@ class CapturePreview:
     red_shape_distance: float = 0.0
     red_anomaly: bool = False
     red_warning: str = ""
+    global_fallback: bool = False
     sharpness: float = 0.0
     motion_px: float = 999.0
     can_capture: bool = False
@@ -369,12 +371,91 @@ class SparseCaptureSession:
             return preview
         # 先试上一张；失败时再试更早的已拍关键帧，保证回到旧区域时
         # 红色并集仍能恢复，而不是只认最后一张。
-        candidates = [last]
+        local_candidates = [last]
         for kf in reversed(self.keyframes[:-1]):
-            if len(candidates) >= 5:
+            if len(local_candidates) >= 5:
                 break
-            candidates.append(kf)
-        best: tuple[CapturedKeyframe, np.ndarray, int, int] | None = None
+            local_candidates.append(kf)
+        best, best_good_count = self._match_preview_candidates(features, local_candidates)
+        if best is None and len(self.keyframes) > len(local_candidates):
+            # 只有局部邻域完全匹配不上时才启用全图候选；
+            # 正常顺序扫描不会把几十张关键帧都参与匹配。
+            local_ids = {kf.index for kf in local_candidates}
+            remaining = [kf for kf in self.keyframes if kf.index not in local_ids]
+            remaining.sort(
+                key=lambda kf: int(
+                    np.count_nonzero(features.global_descriptor != kf.global_descriptor)
+                )
+            )
+            preview.global_fallback = True
+            best, global_good = self._match_preview_candidates(features, remaining[:6])
+            best_good_count = max(best_good_count, global_good)
+        if best is None:
+            self._clear_red_guard()
+            preview.matches = best_good_count
+            preview.message = (
+                f"局部与全局都没匹配上（最佳 {best_good_count}），请回退一点"
+            )
+            preview.reason = "no_matches"
+            self._last_preview = preview
+            return preview
+        matched_keyframe, matrix_full, inliers, good_count = best
+        preview.matches = good_count
+        preview.inliers = inliers
+        pose_full = as_homography(matched_keyframe.pose) @ as_homography(matrix_full)
+        preview.pose = pose_full
+        # 红区直接从“板级覆盖 mask”warp 到当前画面，不再逐关键帧投影/布尔并集。
+        # 这样预览耗时与已拍张数基本无关，也避免几十张 coverage 的路径并集变慢。
+        red_mask = self._warp_coverage_to_view(
+            pose_full,
+            frame.shape[1],
+            frame.shape[0],
+        )
+        preview.coverage_polygons = []
+        preview.coverage_mask = red_mask
+        preview.verified_keyframes = 1 if np.any(red_mask) else 0
+        preview.red_metrics = compute_red_metrics(red_mask)
+        preview.covered_fraction = preview.red_metrics.area_fraction
+        preview.new_fraction = max(0.0, 1.0 - preview.covered_fraction)
+        self._evaluate_red_guard(preview, red_mask, pose_full)
+        if preview.covered_fraction < self.config.min_overlap:
+            preview.can_capture = False
+            preview.message = (
+                f"红色覆盖仅 {preview.covered_fraction:.0%}，重叠不足；"
+                "请回到上一张覆盖区域内"
+            )
+            preview.reason = "overlap_low"
+        elif preview.covered_fraction > self.config.max_overlap:
+            preview.can_capture = False
+            preview.message = (
+                f"红色覆盖 {preview.covered_fraction:.0%}，移动太少；"
+                "请移动到一个新的板区域"
+            )
+            preview.reason = "overlap_high"
+        elif not stable:
+            preview.can_capture = False
+            preview.message = "位置已对好，但画面未稳定；请停稳后再拍"
+            preview.reason = "unstable"
+        else:
+            preview.can_capture = True
+            preview.message = (
+                f"可拍摄 · 覆盖 {preview.covered_fraction:.0%} · "
+                f"内点 {inliers} · 新区域 {preview.new_fraction:.0%}"
+            )
+            preview.reason = "ready"
+        if preview.red_anomaly:
+            # 面积/外形只是告警，不直接阻断拍摄；真正阻断交给 ORB 重叠和
+            # 清晰的覆盖 mask。这样正常换行/回到旧区域不会被误杀。
+            if preview.can_capture:
+                preview.message += f"（红区面积/外形波动：{preview.red_warning}）"
+        self._last_preview = preview
+        return preview
+
+    def _match_preview_candidates(
+        self,
+        features: FeatureSet,
+        candidates: list[CapturedKeyframe],
+    ) -> tuple[tuple[CapturedKeyframe, np.ndarray, int, int] | None, int]:
         best_good_count = 0
         for candidate in candidates:
             knn = self._matcher.knnMatch(features.descriptors, candidate.descriptors, k=2)
@@ -406,75 +487,12 @@ class SparseCaptureSession:
                 continue
             h_work = np.eye(3, dtype=np.float64)
             h_work[:2, :] = matrix_work
-            live_scale = features.scale
-            matrix_full = h_work @ np.diag([live_scale, live_scale, 1.0])
+            matrix_full = h_work @ np.diag([features.scale, features.scale, 1.0])
             matrix_full = matrix_full[:2, :].astype(np.float32)
             if not is_valid_similarity(matrix_full):
                 continue
-            best = (candidate, matrix_full, inliers, len(good))
-            break
-        if best is None:
-            self._clear_red_guard()
-            preview.matches = best_good_count
-            preview.message = (
-                f"与已拍区域匹配不足（匹配 {best_good_count}），请回退一点"
-            )
-            preview.reason = "no_matches"
-            self._last_preview = preview
-            return preview
-        matched_keyframe, matrix_full, inliers, good_count = best
-        preview.matches = good_count
-        preview.inliers = inliers
-        pose_full = as_homography(matched_keyframe.pose) @ as_homography(matrix_full)
-        preview.pose = pose_full
-        coverage_polys = self._project_verified_coverage(
-            features,
-            pose_full,
-            matched_keyframe.index,
-            frame.shape[1],
-            frame.shape[0],
-        )
-        preview.coverage_polygons = coverage_polys
-        preview.verified_keyframes = len(coverage_polys)
-        red_mask = self._rasterize_coverage(coverage_polys, frame.shape[1], frame.shape[0])
-        preview.red_metrics = compute_red_metrics(red_mask)
-        preview.covered_fraction = preview.red_metrics.area_fraction
-        preview.new_fraction = max(0.0, 1.0 - preview.covered_fraction)
-        self._evaluate_red_guard(preview, red_mask, pose_full)
-        if preview.covered_fraction < self.config.min_overlap:
-            preview.can_capture = False
-            preview.message = (
-                f"红色覆盖仅 {preview.covered_fraction:.0%}，重叠不足；"
-                "请回到上一张覆盖区域内"
-            )
-            preview.reason = "overlap_low"
-        elif preview.covered_fraction > self.config.max_overlap:
-            preview.can_capture = False
-            preview.message = (
-                f"红色覆盖 {preview.covered_fraction:.0%}，移动太少；"
-                "请移动到一个新的板区域"
-            )
-            preview.reason = "overlap_high"
-        elif not stable:
-            preview.can_capture = False
-            preview.message = "位置已对好，但画面未稳定；请停稳后再拍"
-            preview.reason = "unstable"
-        else:
-            preview.can_capture = True
-            preview.message = (
-                f"可拍摄 · 覆盖 {preview.covered_fraction:.0%} · "
-                f"内点 {inliers} · 新区域 {preview.new_fraction:.0%}"
-            )
-            preview.reason = "ready"
-        if preview.red_anomaly:
-            preview.can_capture = False
-            preview.message = (
-                f"红区面积/外形突变（{preview.red_warning}），疑似误识别；"
-                "请回退到上一张附近，稳定两帧再拍"
-            )
-            preview.reason = "red_anomaly"
-        self._last_preview = preview
-        return preview
+            return (candidate, matrix_full, inliers, len(good)), best_good_count
+        return None, best_good_count
 
     def _project_coverage(self, pose_current: np.ndarray, width: int, height: int) -> list[np.ndarray]:
         inv = invert_affine(pose_current)
@@ -572,6 +590,28 @@ class SparseCaptureSession:
         scale_expected = math.sqrt(max(1e-9, abs(float(np.linalg.det(expected[:, :2])))))
         ds = abs(scale_measured - scale_expected) / max(scale_expected, 1e-6)
         return dt <= 22.0 and da <= 4.0 and ds <= 0.08
+
+    def _warp_coverage_to_view(
+        self,
+        pose_current: np.ndarray,
+        width: int,
+        height: int,
+    ) -> np.ndarray:
+        if self._canvas is None or self._coverage_mask is None:
+            return np.zeros((height, width), dtype=np.uint8)
+        combined = self._world_to_overview() @ as_homography(pose_current)
+        try:
+            inverse = np.linalg.inv(combined)
+            return cv2.warpAffine(
+                self._coverage_mask,
+                inverse[:2, :].astype(np.float32),
+                (width, height),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+        except (np.linalg.LinAlgError, cv2.error):
+            return np.zeros((height, width), dtype=np.uint8)
 
     @staticmethod
     def _rasterize_coverage(polygons: list[np.ndarray], width: int, height: int) -> np.ndarray:
@@ -759,8 +799,11 @@ class SparseCaptureSession:
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0),
         )
+        # 黑边/背景不参与覆盖和混合，否则会变成接缝处的细黑线。
+        valid_src = (np.max(image, axis=2) > 7).astype(np.uint8) * 255
+        valid_src = cv2.morphologyEx(valid_src, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.warpAffine(
-            np.full((h, w), 255, dtype=np.uint8),
+            valid_src,
             transform[:2, :],
             (self._canvas.shape[1], self._canvas.shape[0]),
             flags=cv2.INTER_NEAREST,
@@ -780,15 +823,8 @@ class SparseCaptureSession:
         alpha = alpha[..., None]
         blended = self._canvas.astype(np.float32) * (1.0 - alpha) + warped.astype(np.float32) * alpha
         self._canvas = np.clip(blended, 0, 255).astype(np.uint8)
-        # 覆盖并集使用几何多边形，而不是图像 alpha，保证红区语义稳定。
-        poly = np.round(
-            cv2.transform(
-                np.asarray(keyframe.coverage, dtype=np.float32).reshape(-1, 1, 2),
-                self._world_to_overview()[:2, :],
-            ).reshape(-1, 2)
-        ).astype(np.int32)
-        if len(poly) >= 3:
-            cv2.fillPoly(self._coverage_mask, [poly], 255)
+        # 覆盖并集使用实际非黑像素 mask，而不是整帧矩形；黑边不会被算作已拍。
+        self._coverage_mask = cv2.bitwise_or(self._coverage_mask, mask)
         self._overview_version += 1
 
     def _refine_keyframe_to_canvas(self, keyframe: CapturedKeyframe, image: np.ndarray) -> None:
@@ -809,8 +845,9 @@ class SparseCaptureSession:
             borderValue=(0, 0, 0),
         )
         h, w = image.shape[:2]
+        valid_src = (np.max(image, axis=2) > 7).astype(np.uint8) * 255
         mask = cv2.warpAffine(
-            np.full((h, w), 255, dtype=np.uint8),
+            valid_src,
             B[:2, :],
             (self._canvas.shape[1], self._canvas.shape[0]),
             flags=cv2.INTER_NEAREST,
@@ -1083,12 +1120,15 @@ class SparseCaptureSession:
         self._stable_run = 0
         self._red_memory.append(preview.red_metrics)
         if preview.pose is not None and preview.red_metrics.area_px > 0:
-            mask = self._rasterize_coverage(
-                preview.coverage_polygons,
-                self._last_frame.shape[1] if self._last_frame is not None else 0,
-                self._last_frame.shape[0] if self._last_frame is not None else 0,
-            )
-            self._capture_red_mask = mask
+            mask = preview.coverage_mask
+            if mask is None:
+                mask = self._rasterize_coverage(
+                    preview.coverage_polygons,
+                    self._last_frame.shape[1] if self._last_frame is not None else 0,
+                    self._last_frame.shape[0] if self._last_frame is not None else 0,
+                )
+            self._capture_red_mask = mask.copy()
+            
             self._capture_red_pose = np.asarray(preview.pose, dtype=np.float64).reshape(3, 3).copy()
             self._capture_red_metrics = preview.red_metrics
         self._red_anomaly_run = 0
