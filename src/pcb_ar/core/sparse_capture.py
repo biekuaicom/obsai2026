@@ -73,6 +73,7 @@ class CapturePreview:
     message: str = "等待稳定画面…"
     pose: np.ndarray | None = None
     coverage_polygons: list[np.ndarray] = field(default_factory=list)
+    verified_keyframes: int = 0
     covered_fraction: float = 0.0
     new_fraction: float = 1.0
     matches: int = 0
@@ -307,8 +308,15 @@ class SparseCaptureSession:
         preview.inliers = inliers
         pose_full = as_homography(matched_keyframe.pose) @ as_homography(matrix_full)
         preview.pose = pose_full
-        coverage_polys = self._project_coverage(pose_full, frame.shape[1], frame.shape[0])
+        coverage_polys = self._project_verified_coverage(
+            features,
+            pose_full,
+            matched_keyframe.index,
+            frame.shape[1],
+            frame.shape[0],
+        )
         preview.coverage_polygons = coverage_polys
+        preview.verified_keyframes = len(coverage_polys)
         preview.covered_fraction = self._coverage_fraction(
             coverage_polys, frame.shape[1], frame.shape[0]
         )
@@ -353,6 +361,90 @@ class SparseCaptureSession:
                 continue
             result.append(mapped)
         return result
+
+    def _project_verified_coverage(
+        self,
+        features: FeatureSet,
+        pose_current: np.ndarray,
+        source_index: int,
+        width: int,
+        height: int,
+    ) -> list[np.ndarray]:
+        """只为“当前帧能直接匹配上”的旧关键帧画红区。
+
+        旧逻辑把全部关键帧 coverage 按当前位姿投影；只要某个旧位姿漂了，
+        整块矩形就会被误画成已拍。这里要求非来源关键帧必须与当前帧有
+        足够的 ORB 重叠，且匹配变换与历史位姿一致，否则不参与红区。
+        """
+        inv = invert_affine(pose_current)
+        result: list[np.ndarray] = []
+        extra = 0
+        for kf in reversed(self.keyframes):
+            poly = np.asarray(kf.coverage, dtype=np.float32).reshape(-1, 1, 2)
+            mapped = cv2.transform(poly, inv).reshape(-1, 2)
+            if mapped[:, 0].max() < -20 or mapped[:, 1].max() < -20:
+                continue
+            if mapped[:, 0].min() > width + 20 or mapped[:, 1].min() > height + 20:
+                continue
+            if kf.index != source_index:
+                if extra >= 3:
+                    continue
+                extra += 1
+                if not self._coverage_match_ok(features, kf, pose_current):
+                    continue
+            result.append(mapped)
+        return result
+
+    def _coverage_match_ok(
+        self,
+        features: FeatureSet,
+        keyframe: CapturedKeyframe,
+        pose_current: np.ndarray,
+    ) -> bool:
+        if features.descriptors.size == 0 or keyframe.descriptors.size == 0:
+            return False
+        try:
+            knn = self._matcher.knnMatch(features.descriptors, keyframe.descriptors, k=2)
+        except cv2.error:
+            return False
+        good = []
+        for pair in knn:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < self.config.ratio * n.distance:
+                good.append(m)
+        if len(good) < self.config.min_matches:
+            return False
+        src = np.float32([features.keypoints[m.queryIdx] for m in good]).reshape(-1, 2)
+        dst = np.float32([keyframe.keypoints[m.trainIdx] for m in good]).reshape(-1, 2)
+        matrix, mask = cv2.estimateAffinePartial2D(
+            src,
+            dst,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=self.config.ransac_px,
+            maxIters=2000,
+            confidence=0.995,
+        )
+        if matrix is None or mask is None:
+            return False
+        if int(np.count_nonzero(mask)) < self.config.min_inliers:
+            return False
+        # 当前帧 -> 关键帧的期望变换必须与 ORB 实测变换一致，
+        # 防止“匹配到了重复纹理，但历史位姿已经漂移”的旧 coverage。
+        expected_full = np.linalg.inv(as_homography(keyframe.pose)) @ as_homography(pose_current)
+        s = max(features.scale, 1e-6)
+        expected_work = expected_full @ np.diag([1.0 / s, 1.0 / s, 1.0])
+        expected = expected_work[:2, :]
+        dt = float(np.hypot(matrix[0, 2] - expected[0, 2], matrix[1, 2] - expected[1, 2]))
+        angle_measured = math.atan2(float(matrix[1, 0]), float(matrix[0, 0]))
+        angle_expected = math.atan2(float(expected[1, 0]), float(expected[0, 0]))
+        da = abs(math.degrees(angle_measured - angle_expected))
+        da = min(da, 360.0 - da)
+        scale_measured = math.sqrt(max(1e-9, abs(float(np.linalg.det(matrix[:, :2])))))
+        scale_expected = math.sqrt(max(1e-9, abs(float(np.linalg.det(expected[:, :2])))))
+        ds = abs(scale_measured - scale_expected) / max(scale_expected, 1e-6)
+        return dt <= 22.0 and da <= 4.0 and ds <= 0.08
 
     @staticmethod
     def _coverage_fraction(polygons: list[np.ndarray], width: int, height: int) -> float:

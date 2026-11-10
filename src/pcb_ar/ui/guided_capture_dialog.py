@@ -350,7 +350,7 @@ class GuidedCaptureDialog(QDialog):
         )
         self.overlap_label.setText(
             f"红色覆盖 {preview.covered_fraction:.0%} · 新区域 {preview.new_fraction:.0%} · "
-            f"内点 {preview.inliers}"
+            f"内点 {preview.inliers} · 已复核 {preview.verified_keyframes} 张"
         )
         self.metrics_label.setText(
             f"关键帧 {self.session.count} · 移动 {preview.motion_px:.1f}px · "
