@@ -1376,9 +1376,21 @@ class MainWindow(QMainWindow):
             except ValueError:
                 relative = str(manifest)
             store.project.sparse_map = relative
+            if result.structural_map is not None:
+                structural_path = result.structural_map.save(store.assets_dir / "structural_map.json")
+                try:
+                    structural_rel = structural_path.relative_to(store.path.parent).as_posix()
+                except ValueError:
+                    structural_rel = str(structural_path)
+                store.project.structural_map = structural_rel
             store.project.map_mode = "hybrid"
+            structure_text = (
+                f"；结构基元：{result.structural_map.describe()}"
+                if result.structural_map is not None
+                else ""
+            )
             store.project.notes = (
-                f"由轻量引导捕获生成：{result.keyframe_count} 个关键帧，"
+                f"由轻量引导捕获生成：{result.keyframe_count} 个关键帧{structure_text}。"
                 "稀疏关键帧定位为默认，低分辨率总览用于全图增强/人工查看。"
                 "建议先标定 mm/px 并人工核对。"
             )

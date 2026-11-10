@@ -58,6 +58,15 @@ class ProjectStore:
         return path.resolve()
 
     @property
+    def structural_map_path(self) -> Path | None:
+        if not self.project.structural_map:
+            return None
+        path = Path(self.project.structural_map)
+        if not path.is_absolute():
+            path = self.path.parent / path
+        return path.resolve()
+
+    @property
     def dirty(self) -> bool:
         return self._dirty
 
@@ -154,6 +163,7 @@ class ProjectStore:
     def save_as(self, new_path: str | Path) -> "ProjectStore":
         old_assets = self.assets_dir
         old_sparse = self.sparse_map_path
+        old_structural = self.structural_map_path
         new_path = _ensure_suffix(Path(new_path))
         new_path.parent.mkdir(parents=True, exist_ok=True)
         new_stem = _project_stem(new_path)
@@ -175,6 +185,12 @@ class ProjectStore:
         self.project.global_image = f"{new_assets.name}/global_board.png"
         if old_sparse is not None and old_sparse.exists() and old_sparse.parent.resolve() == old_assets.resolve():
             self.project.sparse_map = f"{new_assets.name}/{old_sparse.name}"
+        if (
+            old_structural is not None
+            and old_structural.exists()
+            and old_structural.parent.resolve() == old_assets.resolve()
+        ):
+            self.project.structural_map = f"{new_assets.name}/{old_structural.name}"
         self.path = new_path
         self.assets_dir = new_assets
         self.save()

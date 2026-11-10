@@ -28,6 +28,7 @@ from pcb_ar.core.sparse_map import (
     SparseMap,
     extract_features,
 )
+from pcb_ar.core.structural_map import StructuralMap, extract_structural_map
 
 ProgressCb = Callable[[int, int, str], None]
 
@@ -202,6 +203,7 @@ class SparseCaptureResult:
     build_seconds: float = 0.0
     rectified: bool = False
     rectify_message: str = ""
+    structural_map: StructuralMap | None = None
 
 
 class SparseCaptureSession:
@@ -1103,14 +1105,14 @@ class SparseCaptureSession:
             raise SparseCaptureError("增量总览尚未生成")
         started = time.perf_counter()
         if progress:
-            progress(0, 2, "使用增量总览与已保存位姿…")
+            progress(0, 3, "使用增量总览与已保存位姿…")
         overview = self._canvas.copy()
         world_to_board = self._world_to_overview()
         rectified = False
         rectify_message = ""
         if self.config.rectify_board:
             if progress:
-                progress(1, 2, "检测板边并拉正外轮廓…")
+                progress(1, 3, "检测板边并拉正外轮廓…")
             rr = rectify_board(
                 overview,
                 max_side=self.config.rectify_max_side,
@@ -1159,7 +1161,15 @@ class SparseCaptureSession:
             board_height=int(overview.shape[0]),
         )
         if progress:
-            progress(2, 2, "稀疏地图构建完成")
+            progress(2, 3, "提取结构特征树…")
+        structural: StructuralMap | None = None
+        try:
+            structural = extract_structural_map(overview)
+        except Exception:  # noqa: BLE001
+            # 结构树是增强数据，失败不应让已经完成的建图前功尽弃。
+            structural = None
+        if progress:
+            progress(3, 3, "稀疏地图与结构特征构建完成")
         return SparseCaptureResult(
             overview=overview,
             sparse_map=sparse,
@@ -1168,6 +1178,7 @@ class SparseCaptureSession:
             build_seconds=time.perf_counter() - started,
             rectified=rectified,
             rectify_message=rectify_message,
+            structural_map=structural,
         )
 
 

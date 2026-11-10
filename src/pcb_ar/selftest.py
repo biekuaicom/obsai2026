@@ -116,6 +116,13 @@ def run_self_test(
                 f"keyframes={sparse_map.count}, overview={sparse_result.overview.shape}, "
                 f"state={sparse_track.state}, inliers={sparse_track.inliers}",
             )
+            structural = sparse_result.structural_map
+            _check(
+                report,
+                "structural_map",
+                structural is not None and structural.component_count > 0,
+                structural.describe() if structural is not None else "未生成",
+            )
             if sparse_map.count == 3:
                 sparse_dir = base / "sparse_assets"
                 manifest = sparse_map.save(sparse_dir)

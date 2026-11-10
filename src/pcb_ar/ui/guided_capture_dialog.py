@@ -477,13 +477,20 @@ class GuidedCaptureDialog(QDialog):
             f"关键帧 {result.keyframe_count} 张 · 已逐张合并 · "
             f"{'板边已拉正' if result.rectified else '保留原板边'}"
         )
+        structure = (
+            f"\n结构：{result.structural_map.describe()}"
+            if result.structural_map is not None
+            else "\n结构：未生成"
+        )
         self.result_label.setText(
             f"关键帧 {result.keyframe_count} 张 · 增量总览 "
             f"{result.overview.shape[1]}×{result.overview.shape[0]} px · "
-            f"收尾耗时 {result.build_seconds:.2f}s"
+            f"收尾耗时 {result.build_seconds:.2f}s{structure}"
         )
         self.result_bar.show()
-        self.build_status.setText("可以导入为新工程，开始自动检测和人工核对。")
+        self.build_status.setText(
+            "可以导入为新工程，开始自动检测和人工核对；结构特征已一并保存。"
+        )
         self.cancel_button.setEnabled(True)
 
     def _on_build_failed(self, message: str) -> None:

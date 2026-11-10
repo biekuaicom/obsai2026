@@ -229,6 +229,7 @@ class Project:
     notes: str = ""
     demo: bool = False
     sparse_map: str = ""
+    structural_map: str = ""
     map_mode: str = "full"
     schema_version: int = SCHEMA_VERSION
     created_at: str = field(default_factory=now_iso)
@@ -247,6 +248,7 @@ class Project:
         self.height = int(self.height)
         self.mm_per_px = float(self.mm_per_px or 0.0)
         self.sparse_map = _clean_text(self.sparse_map)
+        self.structural_map = _clean_text(self.structural_map)
         self.map_mode = _clean_text(self.map_mode, "full") or "full"
         if self.map_mode not in ("full", "sparse", "hybrid"):
             self.map_mode = "full"
@@ -348,6 +350,7 @@ class Project:
             "mm_per_px": self.mm_per_px,
             "demo": self.demo,
             "sparse_map": self.sparse_map,
+            "structural_map": self.structural_map,
             "map_mode": self.map_mode,
             "components": [c.to_dict() for c in self.components],
             "fiducials": [f.to_dict() for f in self.fiducials],
@@ -374,6 +377,7 @@ class Project:
             notes=_clean_text(raw.get("notes")),
             demo=bool(raw.get("demo", False)),
             sparse_map=_clean_text(raw.get("sparse_map")),
+            structural_map=_clean_text(raw.get("structural_map")),
             map_mode=_clean_text(raw.get("map_mode"), "full"),
             schema_version=schema,
             created_at=_clean_text(raw.get("created_at"), now_iso()),

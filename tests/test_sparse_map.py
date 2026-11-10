@@ -39,9 +39,15 @@ def sparse_bundle(board, tmp_path_factory):
 
 
 def test_project_sparse_fields_roundtrip():
-    project = Project(name="x", sparse_map="assets/sparse_map.json", map_mode="hybrid")
+    project = Project(
+        name="x",
+        sparse_map="assets/sparse_map.json",
+        structural_map="assets/structural_map.json",
+        map_mode="hybrid",
+    )
     loaded = Project.from_dict(project.to_dict())
     assert loaded.sparse_map == "assets/sparse_map.json"
+    assert loaded.structural_map == "assets/structural_map.json"
     assert loaded.map_mode == "hybrid"
 
 
@@ -56,6 +62,8 @@ def test_sparse_capture_result(sparse_bundle):
     assert all(k.coverage.shape == (4, 2) for k in loaded.keyframes)
     assert any(k.red_area_ratio > 0 for k in loaded.keyframes)
     assert all(len(k.red_hu) == 7 for k in loaded.keyframes)
+    assert result.structural_map is not None
+    assert result.structural_map.component_count > 0
 
 
 def test_sparse_localization_accuracy(board, sparse_bundle):
@@ -126,6 +134,9 @@ def test_sparse_project_save_as_copies_assets(sparse_bundle, tmp_path):
     store = ProjectStore.create(tmp_path / "a.pcbproj.json", "A", result.overview)
     manifest = result.sparse_map.save(store.assets_dir)
     store.project.sparse_map = manifest.relative_to(store.path.parent).as_posix()
+    if result.structural_map is not None:
+        sp = result.structural_map.save(store.assets_dir / "structural_map.json")
+        store.project.structural_map = sp.relative_to(store.path.parent).as_posix()
     store.project.map_mode = "hybrid"
     store.save()
 
@@ -137,6 +148,8 @@ def test_sparse_project_save_as_copies_assets(sparse_bundle, tmp_path):
     assert (loaded.assets_dir / "sparse_features.npz").exists()
     assert any((loaded.assets_dir / "keyframes").glob("*.jpg"))
     assert SparseMap.load(loaded.sparse_map_path).count == 4
+    assert loaded.project.structural_map
+    assert loaded.structural_map_path is not None and loaded.structural_map_path.exists()
 
 
 def test_hybrid_tracker_uses_sparse_and_full(sparse_bundle, board):
