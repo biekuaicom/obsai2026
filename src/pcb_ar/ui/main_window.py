@@ -36,7 +36,7 @@ from pcb_ar.config import AppConfig
 from pcb_ar.core.bom import BomError, apply_bom, export_bom, load_bom
 from pcb_ar.core.detector import detect_component_candidates
 from pcb_ar.core.geo import BBox, invert_affine, transform_bbox
-from pcb_ar.core.imageio import read_image
+from pcb_ar.core.imageio import read_image, write_image
 from pcb_ar.core.models import (
     STATUS_ISSUE,
     STATUS_PENDING,
@@ -185,6 +185,11 @@ class MainWindow(QMainWindow):
         self.action_save = self._action("保存工程", self.save_project, QKeySequence.StandardKey.Save)
         self.action_save_as = self._action("另存为…", self.save_project_as, "Ctrl+Shift+S")
         self.action_import_bom = self._action("导入 BOM / CSV…", self.import_bom)
+        self.action_export_board = self._action(
+            "导出整张板图…",
+            self.export_board_image,
+            tip="把当前工程的总览图导出为 PNG/JPEG",
+        )
         self.action_export_bom = self._action("导出 BOM / CSV…", self.export_bom)
         self.action_exit = self._action("退出", self.close, "Alt+F4")
 
@@ -237,6 +242,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.action_save_as)
         file_menu.addSeparator()
         file_menu.addAction(self.action_import_bom)
+        file_menu.addAction(self.action_export_board)
         file_menu.addAction(self.action_export_bom)
         file_menu.addSeparator()
         file_menu.addAction(self.action_exit)
@@ -812,6 +818,7 @@ class MainWindow(QMainWindow):
             self.action_save,
             self.action_save_as,
             self.action_import_bom,
+            self.action_export_board,
             self.action_export_bom,
             self.action_detect,
             self.action_draw,
@@ -1309,6 +1316,35 @@ class MainWindow(QMainWindow):
             message += "\n\nBOM 缺少的已标注元件：\n" + "、".join(report.missing[:25])
         QMessageBox.information(self, "BOM 导入结果", message)
 
+    def export_board_image(self) -> None:
+        if self.project is None or self.global_image is None:
+            QMessageBox.information(self, "没有整张图", "请先打开或生成一个工程。")
+            return
+        default_path = default_project_dir() / f"{self.project.name}_整板.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出整张板图",
+            str(default_path),
+            "PNG 图像 (*.png);;JPEG 图像 (*.jpg *.jpeg);;所有文件 (*)",
+        )
+        if not path:
+            return
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(".png")
+        try:
+            self._write_board_image(target)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导出失败", str(exc))
+
+    def _write_board_image(self, target: str | Path) -> Path:
+        if self.global_image is None:
+            raise ValueError("没有可导出的整张图")
+        target = Path(target)
+        write_image(target, self.global_image)
+        self.statusBar().showMessage(f"整张板图已导出：{target}", 5000)
+        return target
+
     def export_bom(self) -> None:
         if self.project is None:
             return
@@ -1389,6 +1425,11 @@ class MainWindow(QMainWindow):
                 if result.structural_map is not None
                 else ""
             )
+            if result.structural_match is not None:
+                structure_text += (
+                    f"；结构复核：{result.structural_match.inliers} 内点 / "
+                    f"置信度 {result.structural_match.confidence:.0%}"
+                )
             store.project.notes = (
                 f"由轻量引导捕获生成：{result.keyframe_count} 个关键帧{structure_text}。"
                 "稀疏关键帧定位为默认，低分辨率总览用于全图增强/人工查看。"

@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 from pcb_ar.core.detector import detect_component_candidates
+from pcb_ar.core.geo import as_homography
 
 STRUCTURAL_MANIFEST = "structural_map.json"
 
@@ -342,6 +343,216 @@ def _build_edges(nodes: list[StructuralNode], width: int, height: int) -> list[S
                 )
             )
     return edges
+
+
+@dataclass
+class StructuralMatch:
+    ok: bool
+    confidence: float
+    inliers: int
+    support: int
+    scale: float = 1.0
+    rotation: float = 0.0
+    matrix: np.ndarray | None = None
+    message: str = ""
+
+
+def transform_structural_map(source: StructuralMap, matrix: np.ndarray) -> StructuralMap:
+    """把结构图坐标（例如关键帧像素）变换到目标坐标（例如总览像素）。"""
+    m = as_homography(matrix)
+    scale = math.sqrt(max(1e-9, abs(float(np.linalg.det(m[:2, :2])))))
+    rotation = math.degrees(math.atan2(float(m[1, 0]), float(m[0, 0])))
+    nodes: list[StructuralNode] = []
+    for n in source.nodes:
+        cx, cy = n.center
+        p = m @ np.array([cx, cy, 1.0])
+        if abs(p[2]) < 1e-9:
+            continue
+        nx, ny = float(p[0] / p[2]), float(p[1] / p[2])
+        nw = max(1, int(round(n.width * scale)))
+        nh = max(1, int(round(n.height * scale)))
+        nodes.append(
+            StructuralNode(
+                id=n.id,
+                kind=n.kind,
+                bbox=(int(round(nx - nw / 2)), int(round(ny - nh / 2)), nw, nh),
+                area=max(1, int(round(n.area * scale * scale))),
+                angle=n.angle + rotation,
+                source=n.source,
+            )
+        )
+    for idx, n in enumerate(nodes):
+        n.id = idx
+    return StructuralMap(
+        width=int(round(source.width * scale)),
+        height=int(round(source.height * scale)),
+        nodes=nodes,
+        edges=[],
+    )
+
+
+def _component_nodes(structural: StructuralMap, limit: int) -> list[StructuralNode]:
+    comps = [n for n in structural.nodes if n.kind == "component"]
+    comps.sort(key=lambda n: n.area, reverse=True)
+    return comps[:limit]
+
+
+def _apply_similarity(point: tuple[float, float], matrix: np.ndarray) -> tuple[float, float]:
+    p = matrix @ np.array([point[0], point[1], 1.0])
+    if abs(p[2]) < 1e-9:
+        return -1e9, -1e9
+    return float(p[0] / p[2]), float(p[1] / p[2])
+
+
+def _score_hypothesis(
+    reference: StructuralMap,
+    query: StructuralMap,
+    ref_components: list[StructuralNode],
+    qry_components: list[StructuralNode],
+    matrix: np.ndarray,
+    tolerance: float,
+) -> tuple[int, int, float]:
+    """返回 (component inliers, auxiliary support, mean distance)。"""
+    ref_pts = np.float32([r.center for r in ref_components])
+    ref_areas = np.float32([max(1, r.area) for r in ref_components])
+    q_pts_h = np.hstack(
+        [np.float32([q.center for q in qry_components]), np.ones((len(qry_components), 1), np.float32)]
+    )
+    q_pts = (q_pts_h @ matrix.T.astype(np.float32))[:, :2]
+    dist = np.linalg.norm(q_pts[:, None, :] - ref_pts[None, :, :], axis=2)
+    q_areas = np.float32([max(1, q.area) for q in qry_components])
+    ratio = q_areas[:, None] / ref_areas[None, :]
+    valid = (dist <= tolerance) & (ratio >= 0.35) & (ratio <= 2.8)
+    used = np.zeros(len(ref_components), dtype=bool)
+    inliers = 0
+    distances: list[float] = []
+    for i in range(len(qry_components)):
+        candidates = np.where(valid[i] & ~used)[0]
+        if candidates.size == 0:
+            continue
+        j = int(candidates[np.argmin(dist[i, candidates])])
+        used[j] = True
+        inliers += 1
+        distances.append(float(dist[i, j]))
+    if inliers < 3:
+        return inliers, 0, 0.0
+    # 焊盘/孔/线段作为辅助证据，权重低于元件本体；限制数量防止匹配爆炸。
+    support = 0
+    aux = [n for n in query.nodes if n.kind != "component"][:18]
+    ref_aux = [n for n in reference.nodes if n.kind != "component"][:24]
+    aux_h = np.hstack([np.float32([q.center for q in aux]), np.ones((len(aux), 1), np.float32)]) if aux else np.zeros((0, 3), np.float32)
+    aux_pts = (aux_h @ matrix.T.astype(np.float32))[:, :2] if len(aux) else np.zeros((0, 2), np.float32)
+    for i, q in enumerate(aux):
+        for r in ref_aux:
+            if r.kind != q.kind:
+                continue
+            rx, ry = r.center
+            if math.hypot(float(aux_pts[i, 0]) - rx, float(aux_pts[i, 1]) - ry) <= tolerance * 0.6:
+                support += 1
+                break
+    mean_d = sum(distances) / len(distances) if distances else 0.0
+    return inliers, support, mean_d
+
+
+def match_structural_maps(
+    reference: StructuralMap,
+    query: StructuralMap,
+    *,
+    max_components: int = 10,
+) -> StructuralMatch:
+    """用元件中心的两两对应生成相似变换假设，做 RANSAC 式结构匹配。
+
+    reference 是整板结构图，query 是局部关键帧/另一张结构图。返回
+    query 坐标 -> reference 坐标的相似变换。
+    """
+    ref_components = _component_nodes(reference, max_components)
+    qry_components = _component_nodes(query, max_components)
+    if len(ref_components) < 3 or len(qry_components) < 3:
+        return StructuralMatch(False, 0.0, 0, 0, message="元件不足 3 个，无法结构匹配")
+    diag_ref = max(1.0, math.hypot(reference.width, reference.height))
+    tolerance = max(8.0, diag_ref * 0.035)
+    best: tuple[int, int, float, np.ndarray] | None = None
+    q_pairs = [(i, j) for i in range(len(qry_components)) for j in range(i + 1, len(qry_components))]
+    r_pairs = [(i, j) for i in range(len(ref_components)) for j in range(i + 1, len(ref_components))]
+    for qi, qj in q_pairs:
+        qa, qb = qry_components[qi], qry_components[qj]
+        qax, qay = qa.center
+        qbx, qby = qb.center
+        dq = math.hypot(qbx - qax, qby - qay)
+        if dq < 4.0:
+            continue
+        aq = math.atan2(qby - qay, qbx - qax)
+        for ri, rj in r_pairs:
+            ra, rb = ref_components[ri], ref_components[rj]
+            rax, ray = ra.center
+            rbx, rby = rb.center
+            dr = math.hypot(rbx - rax, rby - ray)
+            if dr < 4.0:
+                continue
+            scale = dr / dq
+            if scale < 0.25 or scale > 4.0:
+                continue
+            angle = math.atan2(rby - ray, rbx - rax) - aq
+            ca, sa = math.cos(angle), math.sin(angle)
+            # qa 对齐到 ra
+            matrix = np.array(
+                [
+                    [scale * ca, -scale * sa, rax - scale * (ca * qax - sa * qay)],
+                    [scale * sa, scale * ca, ray - scale * (sa * qax + ca * qay)],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+            inliers, support, mean_d = _score_hypothesis(
+                reference, query, ref_components, qry_components, matrix, tolerance
+            )
+            if inliers < 3:
+                continue
+            if best is None or inliers > best[0] or (inliers == best[0] and support > best[1]):
+                best = (inliers, support, mean_d, matrix)
+    if best is None:
+        return StructuralMatch(False, 0.0, 0, 0, message="没有可靠的结构对应")
+    inliers, support, mean_d, matrix = best
+    # 用匹配上的元件中心做一次最小二乘精修。
+    matched_pairs: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    used: set[int] = set()
+    for q in qry_components:
+        qx, qy = _apply_similarity(q.center, matrix)
+        for j, r in enumerate(ref_components):
+            if j in used:
+                continue
+            rx, ry = r.center
+            if math.hypot(qx - rx, qy - ry) <= tolerance:
+                matched_pairs.append((q.center, r.center))
+                used.add(j)
+                break
+    if len(matched_pairs) >= 3:
+        src = np.float32([p[0] for p in matched_pairs]).reshape(-1, 1, 2)
+        dst = np.float32([p[1] for p in matched_pairs]).reshape(-1, 1, 2)
+        refined, _ = cv2.estimateAffinePartial2D(src, dst, method=cv2.LMEDS)
+        if refined is not None:
+            matrix = np.vstack([refined, [0, 0, 1]]).astype(np.float64)
+            inliers, support, mean_d = _score_hypothesis(
+                reference, query, ref_components, qry_components, matrix, tolerance
+            )
+    scale = math.sqrt(max(1e-9, abs(float(np.linalg.det(matrix[:2, :2])))))
+    rotation = math.degrees(math.atan2(float(matrix[1, 0]), float(matrix[0, 0])))
+    confidence = min(1.0, (inliers + 0.25 * support) / max(3.0, float(len(qry_components))))
+    ok = inliers >= 3 and confidence >= 0.35
+    return StructuralMatch(
+        ok=ok,
+        confidence=float(confidence),
+        inliers=int(inliers),
+        support=int(support),
+        scale=float(scale),
+        rotation=float(rotation),
+        matrix=matrix,
+        message=(
+            f"结构匹配 {inliers} 内点 / {support} 辅助 / 置信度 {confidence:.0%}"
+            if ok
+            else f"结构匹配不足（{inliers} 内点，{confidence:.0%}）"
+        ),
+    )
 
 
 def extract_structural_map(image: np.ndarray, *, max_nodes: int = 300) -> StructuralMap:

@@ -13,6 +13,7 @@ from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPi
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -23,6 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from pcb_ar.core.imageio import write_image
 from pcb_ar.core.sparse_capture import (
     CapturePreview,
     SparseCaptureError,
@@ -284,10 +286,15 @@ class GuidedCaptureDialog(QDialog):
         self.result_label = QLabel("")
         self.result_label.setWordWrap(True)
         result_layout.addWidget(self.result_label)
+        result_buttons = QHBoxLayout()
         apply_button = QPushButton("作为新工程导入")
         apply_button.setObjectName("Primary")
         apply_button.clicked.connect(self.accept)
-        result_layout.addWidget(apply_button)
+        self.export_button = QPushButton("导出整张图…")
+        self.export_button.clicked.connect(self.export_overview)
+        result_buttons.addWidget(apply_button, 2)
+        result_buttons.addWidget(self.export_button, 1)
+        result_layout.addLayout(result_buttons)
         self.result_bar.hide()
         right.addWidget(self.result_bar)
 
@@ -482,6 +489,11 @@ class GuidedCaptureDialog(QDialog):
             if result.structural_map is not None
             else "\n结构：未生成"
         )
+        if result.structural_match is not None:
+            structure += (
+                f"\n结构复核：{result.structural_match.inliers} 内点 / "
+                f"置信度 {result.structural_match.confidence:.0%}"
+            )
         self.result_label.setText(
             f"关键帧 {result.keyframe_count} 张 · 增量总览 "
             f"{result.overview.shape[1]}×{result.overview.shape[0]} px · "
@@ -508,6 +520,34 @@ class GuidedCaptureDialog(QDialog):
             thread.deleteLater()
         self._build_thread = None
         self._update_buttons()
+
+    def export_overview(self) -> None:
+        if self.result is None:
+            QMessageBox.information(self, "尚未完成", "请先完成并建立地图。")
+            return
+        default_name = time.strftime("PCB_AR_整板_%Y%m%d-%H%M%S.png")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出整张板图",
+            default_name,
+            "PNG 图像 (*.png);;JPEG 图像 (*.jpg *.jpeg);;所有文件 (*)",
+        )
+        if not path:
+            return
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(".png")
+        try:
+            write_image(target, self.result.overview)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "整张图已导出",
+            f"已导出：\n{target}\n\n尺寸 {self.result.overview.shape[1]}×"
+            f"{self.result.overview.shape[0]} px",
+        )
 
     def accept(self) -> None:
         if self.result is None:

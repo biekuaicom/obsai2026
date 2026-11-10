@@ -28,7 +28,13 @@ from pcb_ar.core.sparse_map import (
     SparseMap,
     extract_features,
 )
-from pcb_ar.core.structural_map import StructuralMap, extract_structural_map
+from pcb_ar.core.structural_map import (
+    StructuralMap,
+    StructuralMatch,
+    extract_structural_map,
+    match_structural_maps,
+    transform_structural_map,
+)
 
 ProgressCb = Callable[[int, int, str], None]
 
@@ -204,6 +210,7 @@ class SparseCaptureResult:
     rectified: bool = False
     rectify_message: str = ""
     structural_map: StructuralMap | None = None
+    structural_match: StructuralMatch | None = None
 
 
 class SparseCaptureSession:
@@ -1105,14 +1112,14 @@ class SparseCaptureSession:
             raise SparseCaptureError("增量总览尚未生成")
         started = time.perf_counter()
         if progress:
-            progress(0, 3, "使用增量总览与已保存位姿…")
+            progress(0, 4, "使用增量总览与已保存位姿…")
         overview = self._canvas.copy()
         world_to_board = self._world_to_overview()
         rectified = False
         rectify_message = ""
         if self.config.rectify_board:
             if progress:
-                progress(1, 3, "检测板边并拉正外轮廓…")
+                progress(1, 4, "检测板边并拉正外轮廓…")
             rr = rectify_board(
                 overview,
                 max_side=self.config.rectify_max_side,
@@ -1161,15 +1168,31 @@ class SparseCaptureSession:
             board_height=int(overview.shape[0]),
         )
         if progress:
-            progress(2, 3, "提取结构特征树…")
+            progress(2, 4, "提取结构特征树…")
         structural: StructuralMap | None = None
         try:
             structural = extract_structural_map(overview)
         except Exception:  # noqa: BLE001
             # 结构树是增强数据，失败不应让已经完成的建图前功尽弃。
             structural = None
+        structural_match: StructuralMatch | None = None
+        if structural is not None and self.keyframes:
+            # B2：用一张信息量最高的关键帧做结构图自校验，验证位姿与结构树一致。
+            if progress:
+                progress(3, 4, "结构图匹配校验…")
+            try:
+                representative = max(self.keyframes, key=lambda k: k.inliers)
+                data = np.frombuffer(representative.jpeg, dtype=np.uint8)
+                keyframe_image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                if keyframe_image is not None:
+                    query = extract_structural_map(keyframe_image)
+                    to_board = world_to_board @ as_homography(representative.pose)
+                    query_board = transform_structural_map(query, to_board)
+                    structural_match = match_structural_maps(structural, query_board)
+            except Exception:  # noqa: BLE001
+                structural_match = None
         if progress:
-            progress(3, 3, "稀疏地图与结构特征构建完成")
+            progress(4, 4, "稀疏地图与结构特征构建完成")
         return SparseCaptureResult(
             overview=overview,
             sparse_map=sparse,
@@ -1179,6 +1202,7 @@ class SparseCaptureSession:
             rectified=rectified,
             rectify_message=rectify_message,
             structural_map=structural,
+            structural_match=structural_match,
         )
 
 

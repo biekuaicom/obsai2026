@@ -47,6 +47,9 @@ def test_main_window_demo_inline_edit_and_screenshot(tmp_path: Path):
         assert window.project is not None
         assert window.project.count >= 20
         assert window.canvas.has_frame
+        exported = window._write_board_image(tmp_path / "board_export.png")
+        assert exported.exists() and exported.stat().st_size > 1000
+        assert window.action_export_board.isEnabled()
 
         board = window.global_image
         frame, truth = synthetic_view(board, (1600, 1050), 0.82, 2.0, (1600, 1000), seed=0)

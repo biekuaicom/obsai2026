@@ -233,7 +233,7 @@ class VideoScanDialog(QDialog):
         result_layout = QHBoxLayout(self.result_bar)
         result_layout.setContentsMargins(8, 6, 8, 6)
         result_layout.setSpacing(6)
-        save = QPushButton("保存 PNG…")
+        save = QPushButton("导出整张图…")
         save.clicked.connect(self.save_result)
         apply = QPushButton("作为新工程导入")
         apply.setObjectName("Primary")

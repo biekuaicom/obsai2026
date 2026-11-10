@@ -64,6 +64,7 @@ def test_sparse_capture_result(sparse_bundle):
     assert all(len(k.red_hu) == 7 for k in loaded.keyframes)
     assert result.structural_map is not None
     assert result.structural_map.component_count > 0
+    assert result.structural_match is not None
 
 
 def test_sparse_localization_accuracy(board, sparse_bundle):
