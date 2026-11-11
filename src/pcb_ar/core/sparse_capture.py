@@ -238,6 +238,7 @@ class SparseCaptureSession:
         self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         self._canvas: np.ndarray | None = None
         self._coverage_mask: np.ndarray | None = None
+        self._coverage_distance: np.ndarray | None = None
         self._canvas_origin = np.zeros(2, dtype=np.float64)
         self._canvas_scale = 1.0
         self._overview_version = 0
@@ -298,6 +299,7 @@ class SparseCaptureSession:
         self._last_preview = None
         self._canvas = None
         self._coverage_mask = None
+        self._coverage_distance = None
         self._canvas_origin = np.zeros(2, dtype=np.float64)
         self._canvas_scale = 1.0
         self._overview_version = 0
@@ -768,6 +770,7 @@ class SparseCaptureSession:
         width, height = size
         self._canvas = np.zeros((height, width, 3), dtype=np.uint8)
         self._coverage_mask = np.zeros((height, width), dtype=np.uint8)
+        self._coverage_distance = np.zeros((height, width), dtype=np.float32)
         self._canvas_origin = np.array(origin, dtype=np.float64)
         self._canvas_scale = float(scale)
 
@@ -779,6 +782,7 @@ class SparseCaptureSession:
         assert self._canvas is not None and self._coverage_mask is not None
         old = self._canvas
         old_mask = self._coverage_mask
+        old_distance = self._coverage_distance
         old_origin = self._canvas_origin.copy()
         scale = self._canvas_scale
         new_w, new_h = new_size
@@ -786,6 +790,7 @@ class SparseCaptureSession:
         dy = int(round((old_origin[1] - new_origin[1]) * scale))
         canvas = np.zeros((new_h, new_w, 3), dtype=np.uint8)
         mask = np.zeros((new_h, new_w), dtype=np.uint8)
+        distance = np.zeros((new_h, new_w), dtype=np.float32)
         x0, y0 = max(0, dx), max(0, dy)
         sx0, sy0 = max(0, -dx), max(0, -dy)
         copy_w = min(old.shape[1] - sx0, new_w - x0)
@@ -793,8 +798,13 @@ class SparseCaptureSession:
         if copy_w > 0 and copy_h > 0:
             canvas[y0 : y0 + copy_h, x0 : x0 + copy_w] = old[sy0 : sy0 + copy_h, sx0 : sx0 + copy_w]
             mask[y0 : y0 + copy_h, x0 : x0 + copy_w] = old_mask[sy0 : sy0 + copy_h, sx0 : sx0 + copy_w]
+            if old_distance is not None:
+                distance[y0 : y0 + copy_h, x0 : x0 + copy_w] = old_distance[
+                    sy0 : sy0 + copy_h, sx0 : sx0 + copy_w
+                ]
         self._canvas = canvas
         self._coverage_mask = mask
+        self._coverage_distance = distance
         self._canvas_origin = np.array(new_origin, dtype=np.float64)
 
     def _blend_keyframe(self, keyframe: CapturedKeyframe, image: np.ndarray) -> None:
@@ -837,15 +847,16 @@ class SparseCaptureSession:
                 0,
                 255,
             ).astype(np.uint8)
-        dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-        alpha = np.clip(dist / float(max(1, self.config.feather_px)), 0.0, 1.0)
-        alpha[new_area] = 1.0
-        # 重叠区不再 55% 平均：平均两张错位图会把文字/引脚变成双影。
-        # distance alpha 让新图在重叠区内部为主，只在 mask 边缘窄羽化；
-        # 重影被限制在一条窄缝，而不是整片重叠区。
-        alpha = alpha[..., None]
-        blended = self._canvas.astype(np.float32) * (1.0 - alpha) + warped.astype(np.float32) * alpha
-        self._canvas = np.clip(blended, 0, 255).astype(np.uint8)
+        dist_new = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        if self._coverage_distance is None or self._coverage_distance.shape != dist_new.shape:
+            self._coverage_distance = np.zeros_like(dist_new, dtype=np.float32)
+        # 接缝源选择：每个像素取“离自己图像边缘更远”的那张，而不是平均两张。
+        # 这样同一文字/引脚只保留一个来源，不会因 1~3px 错位变成双影。
+        better = new_area | (dist_new > self._coverage_distance + 0.35)
+        blended = self._canvas.copy()
+        blended[better] = warped[better]
+        self._canvas = blended
+        self._coverage_distance = np.maximum(self._coverage_distance, dist_new)
         # 覆盖并集使用实际非黑像素 mask，而不是整帧矩形；黑边不会被算作已拍。
         self._coverage_mask = cv2.bitwise_or(self._coverage_mask, mask)
         self._overview_version += 1
@@ -948,6 +959,8 @@ class SparseCaptureSession:
             image = cv2.imdecode(np.frombuffer(keyframe.jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
             if image is None:
                 raise SparseCaptureError("增量总览解码关键帧失败")
+            # 重渲染时也做一次重叠区 ECC，避免最终图丢掉逐张合并时的局部对齐。
+            self._refine_keyframe_to_canvas(keyframe, image)
             self._blend_keyframe(keyframe, image)
 
     def _merge_keyframe(self, keyframe: CapturedKeyframe, image: np.ndarray) -> None:
