@@ -194,6 +194,7 @@ class CapturedKeyframe:
     matches: int = 0
     inliers: int = 0
     pose_source: int = -1
+    content_score: float = 0.0
     seam_applied: bool = False
     seam_cc: float = 0.0
     seam_shift_px: float = 0.0
@@ -1008,13 +1009,66 @@ class SparseCaptureSession:
         self._refine_keyframe_to_canvas(keyframe, image)
         self._blend_keyframe(keyframe, image)
 
+    def _overlap_content_score(
+        self,
+        current_image: np.ndarray,
+        keyframe: CapturedKeyframe,
+        matrix: np.ndarray,
+    ) -> tuple[float, int]:
+        """在重叠区用边缘命中 + 灰度相关核对内容，而不是只看 ORB 内点。
+
+        返回 (0~1 content score, overlap pixels)。文本/焊盘/孔/引脚/走线
+        都会贡献边缘；色块由灰度相关补充。
+        """
+        target = cv2.imdecode(np.frombuffer(keyframe.jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if target is None:
+            return 0.0, 0
+        th, tw = target.shape[:2]
+        if current_image.shape[:2] != (th, tw):
+            current = cv2.resize(current_image, (tw, th), interpolation=cv2.INTER_AREA)
+        else:
+            current = current_image
+        warped = cv2.warpAffine(
+            current,
+            as_homography(matrix)[:2, :],
+            (tw, th),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+        moving_valid = np.max(warped, axis=2) > 7
+        target_valid = np.max(target, axis=2) > 7
+        overlap = moving_valid & target_valid
+        overlap_px = int(np.count_nonzero(overlap))
+        if overlap_px < max(400, int(0.02 * tw * th)):
+            return 0.0, overlap_px
+        mg = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        tg = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
+        me = cv2.Canny(mg, 35, 110)
+        te = cv2.Canny(tg, 35, 110)
+        te = cv2.dilate(te, np.ones((3, 3), np.uint8), iterations=1)
+        moving_edges = int(np.count_nonzero(me & (overlap.astype(np.uint8) * 255)))
+        if moving_edges > 50:
+            hit = int(np.count_nonzero((me > 0) & (te > 0) & overlap))
+            edge_score = min(1.0, hit / float(moving_edges))
+        else:
+            edge_score = 0.0
+        try:
+            corr = float(np.corrcoef(mg[overlap].astype(np.float32), tg[overlap].astype(np.float32))[0, 1])
+        except (ValueError, np.linalg.LinAlgError):
+            corr = 0.0
+        if not np.isfinite(corr):
+            corr = 0.0
+        content = 0.7 * edge_score + 0.3 * max(0.0, corr)
+        return float(max(0.0, min(1.0, content))), overlap_px
+
     def _estimate_keyframe_pose(
         self,
         features: FeatureSet,
         preview: CapturePreview,
         frame_width: int,
         frame_height: int,
-    ) -> tuple[np.ndarray | None, int, int, int]:
+    ) -> tuple[np.ndarray | None, int, int, int, float]:
         """用所有可能重叠的旧关键帧估计新关键帧位姿，降低逐张累加漂移。
 
         返回 (pose_new->scan_world, matches, inliers, source_keyframe_index)。
@@ -1036,6 +1090,8 @@ class SparseCaptureSession:
         best_matches = 0
         best_inliers = 0
         best_index = -1
+        best_content = 0.0
+        best_score = -1.0
         for kf in candidates:
             if kf.descriptors.size == 0:
                 continue
@@ -1070,12 +1126,19 @@ class SparseCaptureSession:
             pose = as_homography(kf.pose) @ as_homography(matrix)
             if not is_valid_similarity(pose):
                 continue
-            if (inliers, -kf.index) > (best_inliers, -best_index if best_index >= 0 else -10**9):
+            content, overlap_px = self._overlap_content_score(features.image, kf, matrix)
+            # 内点只是候选；重叠区真实边缘/灰度核对才算数。
+            score = inliers * (0.65 + 1.35 * content)
+            if content < 0.06 and overlap_px > 10000:
+                score *= 0.45
+            if score > best_score:
                 best_pose = pose
                 best_matches = len(good)
                 best_inliers = inliers
                 best_index = kf.index
-        return best_pose, best_matches, best_inliers, best_index
+                best_content = content
+                best_score = score
+        return best_pose, best_matches, best_inliers, best_index, best_content
 
     # ------------------------------------------------------------------ 拍摄
     def capture(self) -> CaptureAcceptance:
@@ -1104,11 +1167,12 @@ class SparseCaptureSession:
         pose_source = -1
         pose_matches = 0
         pose_inliers = 0
+        pose_content = 0.0
         if self.keyframes:
             if preview.pose is None:
                 return CaptureAcceptance(False, "没有可用的位置关系，请回退后重试")
             # 优先与“覆盖当前视场的较老关键帧”匹配，避免只能相对上一张累加。
-            pose_kf, pose_matches, pose_inliers, pose_source = self._estimate_keyframe_pose(
+            pose_kf, pose_matches, pose_inliers, pose_source, pose_content = self._estimate_keyframe_pose(
                 features, preview, frame.shape[1], frame.shape[0]
             )
             if pose_kf is None:
@@ -1144,6 +1208,7 @@ class SparseCaptureSession:
             matches=pose_matches,
             inliers=pose_inliers,
             pose_source=pose_source,
+            content_score=pose_content,
         )
         self.keyframes.append(record)
         try:
@@ -1171,6 +1236,8 @@ class SparseCaptureSession:
         suffix = ""
         if record.seam_applied:
             suffix = f"；板边对齐 {record.seam_shift_px:.1f}px"
+        if record.content_score > 0:
+            suffix += f"；重叠内容核对 {record.content_score:.0%}"
         message = (
             "已拍摄第一张并立即并入总览，请移动到相邻区域并保留一部分红色覆盖"
             if len(self.keyframes) == 1
