@@ -28,6 +28,7 @@ from pcb_ar.core.sparse_map import (
     SparseMap,
     extract_features,
 )
+from pcb_ar.core.board_mask import foreground_mask
 from pcb_ar.core.pose_graph import build_pose_edges, optimize_poses
 from pcb_ar.core.seam_elements import ElementSet, extract_elements, match_elements
 from pcb_ar.core.structural_map import (
@@ -198,6 +199,7 @@ class CapturedKeyframe:
     content_score: float = 0.0
     elements: ElementSet | None = None
     element_inliers: int = 0
+    board_mask: np.ndarray | None = None
     seam_applied: bool = False
     seam_cc: float = 0.0
     seam_shift_px: float = 0.0
@@ -242,6 +244,7 @@ class SparseCaptureSession:
         self._last_preview: CapturePreview | None = None
         self._prev_preview_frame: np.ndarray | None = None
         self._prev_preview_pose: np.ndarray | None = None
+        self._capture_board_mask: np.ndarray | None = None
         self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         self._canvas: np.ndarray | None = None
         self._coverage_mask: np.ndarray | None = None
@@ -306,6 +309,7 @@ class SparseCaptureSession:
         self._last_preview = None
         self._prev_preview_frame = None
         self._prev_preview_pose = None
+        self._capture_board_mask = None
         self._canvas = None
         self._coverage_mask = None
         self._coverage_distance = None
@@ -859,9 +863,10 @@ class SparseCaptureSession:
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0),
         )
-        # 黑边/背景不参与覆盖和混合，否则会变成接缝处的细黑线。
-        valid_src = (np.max(image, axis=2) > 7).astype(np.uint8) * 255
-        valid_src = cv2.morphologyEx(valid_src, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        # 只让 PCB 板面参与覆盖和混合；白纸/桌面不能进入总览和红区。
+        valid_src = keyframe.board_mask
+        if valid_src is None or valid_src.shape != image.shape[:2]:
+            valid_src = foreground_mask(image)
         mask = cv2.warpAffine(
             valid_src,
             transform[:2, :],
@@ -887,7 +892,14 @@ class SparseCaptureSession:
                 0,
                 255,
             ).astype(np.uint8)
-        dist_new = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        # 只在有效 mask 的 bbox 内做距离变换，避免后期画布变大后每拍一张
+        # 都对整张 3000×3000 做 distanceTransform。
+        bx, by, bw, bh = cv2.boundingRect(mask)
+        dist_new = np.zeros_like(mask, dtype=np.float32)
+        if bw > 0 and bh > 0:
+            dist_new[by : by + bh, bx : bx + bw] = cv2.distanceTransform(
+                mask[by : by + bh, bx : bx + bw], cv2.DIST_L2, 5
+            )
         if self._coverage_distance is None or self._coverage_distance.shape != dist_new.shape:
             self._coverage_distance = np.zeros_like(dist_new, dtype=np.float32)
         # 接缝源选择：每个像素取“离自己图像边缘更远”的那张，而不是平均两张。
@@ -919,7 +931,9 @@ class SparseCaptureSession:
             borderValue=(0, 0, 0),
         )
         h, w = image.shape[:2]
-        valid_src = (np.max(image, axis=2) > 7).astype(np.uint8) * 255
+        valid_src = keyframe.board_mask
+        if valid_src is None or valid_src.shape != (h, w):
+            valid_src = foreground_mask(image)
         mask = cv2.warpAffine(
             valid_src,
             B[:2, :],
@@ -1065,8 +1079,18 @@ class SparseCaptureSession:
         th, tw = target.shape[:2]
         if current_image.shape[:2] != (th, tw):
             current = cv2.resize(current_image, (tw, th), interpolation=cv2.INTER_AREA)
+            current_mask = (
+                cv2.resize(self._capture_board_mask, (tw, th), interpolation=cv2.INTER_NEAREST)
+                if self._capture_board_mask is not None
+                else foreground_mask(current)
+            )
         else:
             current = current_image
+            current_mask = (
+                self._capture_board_mask
+                if self._capture_board_mask is not None
+                else foreground_mask(current)
+            )
         warped = cv2.warpAffine(
             current,
             as_homography(matrix)[:2, :],
@@ -1075,8 +1099,19 @@ class SparseCaptureSession:
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0),
         )
-        moving_valid = np.max(warped, axis=2) > 7
-        target_valid = np.max(target, axis=2) > 7
+        moving_valid = cv2.warpAffine(
+            current_mask,
+            as_homography(matrix)[:2, :],
+            (tw, th),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        ) > 0
+        target_valid = (
+            keyframe.board_mask
+            if keyframe.board_mask is not None
+            else (np.max(target, axis=2) > 7).astype(np.uint8) * 255
+        ) > 0
         overlap = moving_valid & target_valid
         overlap_px = int(np.count_nonzero(overlap))
         if overlap_px < max(400, int(0.02 * tw * th)):
@@ -1191,9 +1226,15 @@ class SparseCaptureSession:
                 # 元素匹配只能做“小幅二次校正”，不能直接覆盖 ORB 的全局位姿。
                 # 重复焊盘/孔很容易形成 6 个错误对应；一旦大范围改写矩阵，
                 # 板边会整体错开，这正是 v0.8.0 的回归风险。
-                if element_match.ok and element_match.matrix is not None and element_match.kinds >= 2:
+                if (
+                    element_match.ok
+                    and element_match.matrix is not None
+                    and element_match.kinds >= 2
+                    and element_match.inliers >= 8
+                ):
                     dt, da, ds = self._transform_delta(matrix, element_match.matrix)
-                    if dt <= 6.0 and da <= 0.8 and ds <= 0.02:
+                    # 只允许“微调”，不允许元素匹配改写 ORB 的全局位姿。
+                    if dt <= 2.0 and da <= 0.3 and ds <= 0.005:
                         matrix = element_match.matrix
                         element_inliers = element_match.inliers
             pose = as_homography(kf.pose) @ as_homography(matrix)
@@ -1326,6 +1367,8 @@ class SparseCaptureSession:
             elements = extract_elements(features.image)
         except Exception:  # noqa: BLE001
             elements = None
+        board_mask = foreground_mask(features.image)
+        self._capture_board_mask = board_mask
         pose_source = -1
         pose_matches = 0
         pose_inliers = 0
@@ -1381,6 +1424,7 @@ class SparseCaptureSession:
             content_score=pose_content,
             elements=elements,
             element_inliers=pose_element_inliers,
+            board_mask=board_mask,
         )
         self.keyframes.append(record)
         try:
