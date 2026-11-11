@@ -63,6 +63,7 @@ class SparseCaptureConfig:
     overview_max_pixels: int = 8_000_000
     overview_margin_px: int = 24
     feather_px: int = 10
+    exposure_compensate: bool = True
     jpeg_quality: int = 90
     seam_refine: bool = True
     seam_min_overlap_px: int = 2500
@@ -815,11 +816,24 @@ class SparseCaptureSession:
         existing = self._coverage_mask > 0
         new_area = (mask > 0) & ~existing
         overlap = (mask > 0) & existing
+        if self.config.exposure_compensate and int(np.count_nonzero(overlap)) > 300:
+            # 轻量曝光补偿：只对齐重叠区均值，避免接缝两侧一亮一暗。
+            old_pixels = self._canvas[overlap].astype(np.float32)
+            new_pixels = warped[overlap].astype(np.float32)
+            old_mean = old_pixels.mean(axis=0)
+            new_mean = new_pixels.mean(axis=0)
+            gain = np.clip(old_mean / np.maximum(new_mean, 1.0), 0.75, 1.35)
+            warped = np.clip(
+                warped.astype(np.float32) * gain.reshape(1, 1, 3),
+                0,
+                255,
+            ).astype(np.uint8)
         dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
         alpha = np.clip(dist / float(max(1, self.config.feather_px)), 0.0, 1.0)
         alpha[new_area] = 1.0
-        if np.any(overlap):
-            alpha[overlap] = np.minimum(alpha[overlap], 0.55)
+        # 重叠区不再 55% 平均：平均两张错位图会把文字/引脚变成双影。
+        # distance alpha 让新图在重叠区内部为主，只在 mask 边缘窄羽化；
+        # 重影被限制在一条窄缝，而不是整片重叠区。
         alpha = alpha[..., None]
         blended = self._canvas.astype(np.float32) * (1.0 - alpha) + warped.astype(np.float32) * alpha
         self._canvas = np.clip(blended, 0, 255).astype(np.uint8)
