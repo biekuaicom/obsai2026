@@ -523,6 +523,11 @@ class GuidedCaptureDialog(QDialog):
                 f"\n结构复核：{result.structural_match.inliers} 内点 / "
                 f"置信度 {result.structural_match.confidence:.0%}"
             )
+        if result.pose_graph_optimized:
+            structure += (
+                f"\n位姿图：{result.pose_graph_edges} 边 / {result.loop_closures} 回环 / "
+                f"RMS {result.pose_rms_before:.3f}→{result.pose_rms_after:.3f}"
+            )
         self.result_label.setText(
             f"关键帧 {result.keyframe_count} 张 · 增量总览 "
             f"{result.overview.shape[1]}×{result.overview.shape[0]} px · "

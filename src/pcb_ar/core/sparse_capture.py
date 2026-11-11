@@ -28,6 +28,7 @@ from pcb_ar.core.sparse_map import (
     SparseMap,
     extract_features,
 )
+from pcb_ar.core.pose_graph import build_pose_edges, optimize_poses
 from pcb_ar.core.structural_map import (
     StructuralMap,
     StructuralMatch,
@@ -74,6 +75,9 @@ class SparseCaptureConfig:
     red_iou_warn: float = 0.35
     red_shape_warn: float = 1.15
     red_anomaly_frames: int = 2
+    pose_graph_optimize: bool = True
+    pose_graph_min_loops: int = 1
+    pose_graph_max_loops: int = 1
     rectify_board: bool = True
     rectify_max_side: int = 3200
     rectify_max_pixels: int = 8_000_000
@@ -214,6 +218,11 @@ class SparseCaptureResult:
     rectify_message: str = ""
     structural_map: StructuralMap | None = None
     structural_match: StructuralMatch | None = None
+    pose_graph_optimized: bool = False
+    pose_graph_edges: int = 0
+    loop_closures: int = 0
+    pose_rms_before: float = 0.0
+    pose_rms_after: float = 0.0
 
 
 class SparseCaptureSession:
@@ -1165,15 +1174,50 @@ class SparseCaptureSession:
         if self._canvas is None:
             raise SparseCaptureError("增量总览尚未生成")
         started = time.perf_counter()
+        pose_graph_optimized = False
+        pose_graph_edges = 0
+        loop_closures = 0
+        pose_rms_before = 0.0
+        pose_rms_after = 0.0
         if progress:
-            progress(0, 4, "使用增量总览与已保存位姿…")
+            progress(0, 5, "位姿图/回环检查…")
+        if self.config.pose_graph_optimize and len(self.keyframes) >= 3:
+            try:
+                edges = build_pose_edges(
+                    self.keyframes,
+                    max_loops=self.config.pose_graph_max_loops,
+                )
+                pose_graph_edges = len(edges)
+                loop_closures = sum(1 for e in edges if e.loop)
+                if loop_closures >= self.config.pose_graph_min_loops:
+                    graph = optimize_poses([kf.pose for kf in self.keyframes], edges)
+                    pose_rms_before = graph.rms_before
+                    pose_rms_after = graph.rms_after
+                    if graph.optimized and graph.rms_after <= graph.rms_before * 1.05:
+                        for kf, pose in zip(self.keyframes, graph.poses):
+                            kf.pose = np.asarray(pose, dtype=np.float64).reshape(3, 3)
+                            h, w = kf.shape
+                            corners = np.float32(
+                                [[0, 0], [w, 0], [w, h], [0, h]]
+                            ).reshape(-1, 1, 2)
+                            kf.coverage = cv2.transform(corners, kf.pose[:2, :]).reshape(-1, 2)
+                        bounds = self._world_bounds()
+                        if bounds is not None:
+                            span_x = bounds[2] - bounds[0]
+                            span_y = bounds[3] - bounds[1]
+                            self._rebuild_overview(self._fit_overview_scale(span_x, span_y))
+                        pose_graph_optimized = True
+            except Exception:  # noqa: BLE001
+                pose_graph_optimized = False
+        if progress:
+            progress(1, 5, "使用增量总览与已保存位姿…")
         overview = self._canvas.copy()
         world_to_board = self._world_to_overview()
         rectified = False
         rectify_message = ""
         if self.config.rectify_board:
             if progress:
-                progress(1, 4, "检测板边并拉正外轮廓…")
+                progress(2, 5, "检测板边并拉正外轮廓…")
             rr = rectify_board(
                 overview,
                 max_side=self.config.rectify_max_side,
@@ -1222,7 +1266,7 @@ class SparseCaptureSession:
             board_height=int(overview.shape[0]),
         )
         if progress:
-            progress(2, 4, "提取结构特征树…")
+            progress(3, 5, "提取结构特征树…")
         structural: StructuralMap | None = None
         try:
             structural = extract_structural_map(overview)
@@ -1233,7 +1277,7 @@ class SparseCaptureSession:
         if structural is not None and self.keyframes:
             # B2：用一张信息量最高的关键帧做结构图自校验，验证位姿与结构树一致。
             if progress:
-                progress(3, 4, "结构图匹配校验…")
+                progress(4, 5, "结构图匹配校验…")
             try:
                 representative = max(self.keyframes, key=lambda k: k.inliers)
                 data = np.frombuffer(representative.jpeg, dtype=np.uint8)
@@ -1246,7 +1290,7 @@ class SparseCaptureSession:
             except Exception:  # noqa: BLE001
                 structural_match = None
         if progress:
-            progress(4, 4, "稀疏地图与结构特征构建完成")
+            progress(5, 5, "稀疏地图与结构特征构建完成")
         return SparseCaptureResult(
             overview=overview,
             sparse_map=sparse,
@@ -1257,6 +1301,11 @@ class SparseCaptureSession:
             rectify_message=rectify_message,
             structural_map=structural,
             structural_match=structural_match,
+            pose_graph_optimized=pose_graph_optimized,
+            pose_graph_edges=pose_graph_edges,
+            loop_closures=loop_closures,
+            pose_rms_before=pose_rms_before,
+            pose_rms_after=pose_rms_after,
         )
 
 

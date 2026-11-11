@@ -1430,6 +1430,12 @@ class MainWindow(QMainWindow):
                     f"；结构复核：{result.structural_match.inliers} 内点 / "
                     f"置信度 {result.structural_match.confidence:.0%}"
                 )
+            if result.pose_graph_optimized:
+                structure_text += (
+                    f"；位姿图：{result.pose_graph_edges} 边 / "
+                    f"{result.loop_closures} 回环 / "
+                    f"RMS {result.pose_rms_before:.3f}→{result.pose_rms_after:.3f}"
+                )
             store.project.notes = (
                 f"由轻量引导捕获生成：{result.keyframe_count} 个关键帧{structure_text}。"
                 "稀疏关键帧定位为默认，低分辨率总览用于全图增强/人工查看。"
