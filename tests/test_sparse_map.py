@@ -69,6 +69,19 @@ def test_sparse_capture_result(sparse_bundle):
     assert any(es.elements for es in result.element_sets)
 
 
+def test_deferred_render_keeps_capture_light(board):
+    session = SparseCaptureSession(SparseCaptureConfig(min_sharpness=5))
+    for cx, cy in [(1000, 1000), (1550, 1000)]:
+        frame, _ = synthetic_view(board, (cx, cy), 0.9, 1.5, (1200, 760), seed=0)
+        for _ in range(3):
+            session.preview(frame)
+        assert session.capture().accepted
+    assert session.overview_image is None
+    result = session.finish()
+    assert result.overview is not None and result.overview.size > 0
+    assert len(result.photos) == 2
+
+
 def test_sparse_localization_accuracy(board, sparse_bundle):
     result, sparse, truths, _ = sparse_bundle
     localizer = SparseLocalizer(sparse)
@@ -97,7 +110,9 @@ def test_sparse_localization_accuracy(board, sparse_bundle):
 
 
 def test_overview_merges_immediately_after_each_capture(board):
-    session = SparseCaptureSession(SparseCaptureConfig(min_sharpness=5))
+    session = SparseCaptureSession(
+        SparseCaptureConfig(min_sharpness=5, defer_image_render=False)
+    )
     sizes = []
     versions = []
     for cx, cy in [(1000, 1000), (1550, 1000)]:

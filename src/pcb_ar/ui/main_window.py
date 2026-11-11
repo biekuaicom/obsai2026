@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import time
 import traceback
 from datetime import datetime
@@ -191,6 +192,11 @@ class MainWindow(QMainWindow):
             self.export_board_image,
             tip="把当前工程的总览图导出为 PNG/JPEG",
         )
+        self.action_export_photos = self._action(
+            "导出拍照文件夹…",
+            self.export_photos_folder,
+            tip="复制工程 assets/photos 下的全部局部照片",
+        )
         self.action_export_bom = self._action("导出 BOM / CSV…", self.export_bom)
         self.action_exit = self._action("退出", self.close, "Alt+F4")
 
@@ -244,6 +250,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.action_import_bom)
         file_menu.addAction(self.action_export_board)
+        file_menu.addAction(self.action_export_photos)
         file_menu.addAction(self.action_export_bom)
         file_menu.addSeparator()
         file_menu.addAction(self.action_exit)
@@ -820,6 +827,7 @@ class MainWindow(QMainWindow):
             self.action_save_as,
             self.action_import_bom,
             self.action_export_board,
+            self.action_export_photos,
             self.action_export_bom,
             self.action_detect,
             self.action_draw,
@@ -1346,6 +1354,28 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"整张板图已导出：{target}", 5000)
         return target
 
+    def export_photos_folder(self) -> None:
+        if self.project is None or self.store is None:
+            return
+        source = self.store.assets_dir / "photos"
+        if not source.exists() or not any(source.iterdir()):
+            QMessageBox.information(self, "没有照片", "当前工程没有保存局部照片。")
+            return
+        parent = QFileDialog.getExistingDirectory(self, "选择导出文件夹")
+        if not parent:
+            return
+        destination = Path(parent) / f"{self.project.name}_photos"
+        if destination.exists():
+            destination = Path(parent) / (
+                f"{self.project.name}_photos_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            )
+        try:
+            shutil.copytree(source, destination)
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        QMessageBox.information(self, "拍照文件夹已导出", f"已复制到：\n{destination}")
+
     def export_bom(self) -> None:
         if self.project is None:
             return
@@ -1437,13 +1467,20 @@ class MainWindow(QMainWindow):
                     f"{result.loop_closures} 回环 / "
                     f"RMS {result.pose_rms_before:.3f}→{result.pose_rms_after:.3f}"
                 )
+            photos_dir = store.assets_dir / "photos"
+            photos_dir.mkdir(parents=True, exist_ok=True)
+            for i, jpeg in enumerate(result.photos):
+                (photos_dir / f"kf_{i:03d}.jpg").write_bytes(jpeg)
             element_total = 0
             if result.element_sets:
                 manifest_path = store.assets_dir / "elements_manifest.json"
                 data = {
                     "keyframes": [
                         {"index": i, **es.to_dict()} for i, es in enumerate(result.element_sets)
-                    ]
+                    ],
+                    "final": result.final_elements.to_dict()
+                    if result.final_elements is not None
+                    else None,
                 }
                 manifest_path.write_text(
                     json.dumps(data, ensure_ascii=False, indent=2),
@@ -1451,6 +1488,7 @@ class MainWindow(QMainWindow):
                 )
                 element_total = sum(len(es.elements) for es in result.element_sets)
                 structure_text += f"；元素签名：{element_total} 个"
+            structure_text += f"；局部照片：{len(result.photos)} 张"
             store.project.notes = (
                 f"由轻量引导捕获生成：{result.keyframe_count} 个关键帧{structure_text}。"
                 "稀疏关键帧定位为默认，低分辨率总览用于全图增强/人工查看。"

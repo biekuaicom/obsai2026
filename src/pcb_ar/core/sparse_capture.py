@@ -66,6 +66,7 @@ class SparseCaptureConfig:
     overview_max_pixels: int = 8_000_000
     overview_margin_px: int = 24
     feather_px: int = 10
+    defer_image_render: bool = True
     exposure_compensate: bool = True
     jpeg_quality: int = 90
     seam_refine: bool = True
@@ -230,6 +231,8 @@ class SparseCaptureResult:
     pose_rms_before: float = 0.0
     pose_rms_after: float = 0.0
     element_sets: list[ElementSet] = field(default_factory=list)
+    photos: list[bytes] = field(default_factory=list)
+    final_elements: ElementSet | None = None
 
 
 class SparseCaptureSession:
@@ -249,6 +252,8 @@ class SparseCaptureSession:
         self._canvas: np.ndarray | None = None
         self._coverage_mask: np.ndarray | None = None
         self._coverage_distance: np.ndarray | None = None
+        self._deferred_pending = False
+        self._canvas_rendered = False
         self._canvas_origin = np.zeros(2, dtype=np.float64)
         self._canvas_scale = 1.0
         self._overview_version = 0
@@ -276,6 +281,8 @@ class SparseCaptureSession:
 
     @property
     def overview_image(self) -> np.ndarray | None:
+        if self._deferred_pending and not self._canvas_rendered:
+            return None
         return self._canvas
 
     @property
@@ -313,6 +320,8 @@ class SparseCaptureSession:
         self._canvas = None
         self._coverage_mask = None
         self._coverage_distance = None
+        self._deferred_pending = False
+        self._canvas_rendered = False
         self._canvas_origin = np.zeros(2, dtype=np.float64)
         self._canvas_scale = 1.0
         self._overview_version = 0
@@ -653,7 +662,7 @@ class SparseCaptureSession:
         width: int,
         height: int,
     ) -> np.ndarray:
-        if self._canvas is None or self._coverage_mask is None:
+        if self._coverage_mask is None:
             return np.zeros((height, width), dtype=np.uint8)
         combined = self._world_to_overview() @ as_homography(pose_current)
         try:
@@ -1016,9 +1025,82 @@ class SparseCaptureSession:
             # 重渲染时也做一次重叠区 ECC，避免最终图丢掉逐张合并时的局部对齐。
             self._refine_keyframe_to_canvas(keyframe, image)
             self._blend_keyframe(keyframe, image)
+        self._deferred_pending = False
+        self._canvas_rendered = True
+        self._overview_version += 1
+
+    def _merge_coverage_only(self, keyframe: CapturedKeyframe) -> None:
+        """延迟渲染模式：只更新板级 coverage mask，不合并图像像素。
+
+        拍照阶段不做 warp/混合/曝光/距离变换，因此耗时不随已拍张数增长。
+        完成建图时再统一渲染所有照片。
+        """
+        bounds0 = self._world_bounds()
+        if bounds0 is None:
+            return
+        span_x = bounds0[2] - bounds0[0]
+        span_y = bounds0[3] - bounds0[1]
+        scale = self._fit_overview_scale(span_x, span_y)
+        if self._coverage_mask is None or self._canvas is None:
+            bounds = self._bounds_with_margin(scale)
+            if bounds is None:
+                return
+            self._allocate_canvas((bounds[0], bounds[1]), scale, self._canvas_size(bounds, scale))
+        else:
+            old_origin = self._canvas_origin.copy()
+            old_max_x = old_origin[0] + self._canvas.shape[1] / self._canvas_scale
+            old_max_y = old_origin[1] + self._canvas.shape[0] / self._canvas_scale
+            if scale < self._canvas_scale * 0.999:
+                self._rescale_coverage(scale)
+            else:
+                margin = self.config.overview_margin_px / max(self._canvas_scale, 1e-6)
+                new_origin = (min(old_origin[0], bounds0[0] - margin), min(old_origin[1], bounds0[1] - margin))
+                new_max = (max(old_max_x, bounds0[2] + margin), max(old_max_y, bounds0[3] + margin))
+                new_size = self._canvas_size(
+                    (new_origin[0], new_origin[1], new_max[0], new_max[1]), self._canvas_scale
+                )
+                if (
+                    new_size[0] != self._canvas.shape[1]
+                    or new_size[1] != self._canvas.shape[0]
+                    or new_origin[0] < self._canvas_origin[0] - 1e-6
+                    or new_origin[1] < self._canvas_origin[1] - 1e-6
+                ):
+                    self._expand_canvas(new_origin, new_size)
+        self._stamp_coverage(keyframe)
+        self._deferred_pending = True
+        self._canvas_rendered = False
+        self._overview_version += 1
+
+    def _stamp_coverage(self, keyframe: CapturedKeyframe) -> None:
+        if self._coverage_mask is None:
+            return
+        transform = self._world_to_overview() @ as_homography(keyframe.pose)
+        src = keyframe.board_mask
+        if src is None:
+            src = np.full(keyframe.shape, 255, dtype=np.uint8)
+        mask = cv2.warpAffine(
+            src,
+            transform[:2, :],
+            (self._coverage_mask.shape[1], self._coverage_mask.shape[0]),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        self._coverage_mask = cv2.bitwise_or(self._coverage_mask, mask)
+
+    def _rescale_coverage(self, scale: float) -> None:
+        bounds = self._bounds_with_margin(scale)
+        if bounds is None:
+            return
+        self._allocate_canvas((bounds[0], bounds[1]), scale, self._canvas_size(bounds, scale))
+        for kf in self.keyframes:
+            self._stamp_coverage(kf)
 
     def _merge_keyframe(self, keyframe: CapturedKeyframe, image: np.ndarray) -> None:
         """把新关键帧立即并入已有低分辨率总览，并扩展覆盖并集。"""
+        if self.config.defer_image_render:
+            self._merge_coverage_only(keyframe)
+            return
         if self._canvas is None:
             bounds0 = self._world_bounds()
             if bounds0 is None:
@@ -1508,8 +1590,17 @@ class SparseCaptureSession:
                         pose_graph_optimized = True
             except Exception:  # noqa: BLE001
                 pose_graph_optimized = False
+        if self._deferred_pending and not self._canvas_rendered:
+            if progress:
+                progress(1, 5, "按位姿统一渲染全部照片…")
+            bounds = self._world_bounds()
+            if bounds is None:
+                raise SparseCaptureError("没有可用的关键帧覆盖范围")
+            span_x = bounds[2] - bounds[0]
+            span_y = bounds[3] - bounds[1]
+            self._rebuild_overview(self._fit_overview_scale(span_x, span_y))
         if progress:
-            progress(1, 5, "使用增量总览与已保存位姿…")
+            progress(1, 5, "使用已保存位姿与总览…")
         overview = self._canvas.copy()
         world_to_board = self._world_to_overview()
         rectified = False
@@ -1565,13 +1656,18 @@ class SparseCaptureSession:
             board_height=int(overview.shape[0]),
         )
         if progress:
-            progress(3, 5, "提取结构特征树…")
+            progress(3, 5, "提取结构特征与元素签名…")
         structural: StructuralMap | None = None
         try:
             structural = extract_structural_map(overview)
         except Exception:  # noqa: BLE001
             # 结构树是增强数据，失败不应让已经完成的建图前功尽弃。
             structural = None
+        final_elements: ElementSet | None = None
+        try:
+            final_elements = extract_elements(overview)
+        except Exception:  # noqa: BLE001
+            final_elements = None
         structural_match: StructuralMatch | None = None
         if structural is not None and self.keyframes:
             # B2：用一张信息量最高的关键帧做结构图自校验，验证位姿与结构树一致。
@@ -1606,6 +1702,8 @@ class SparseCaptureSession:
             pose_rms_before=pose_rms_before,
             pose_rms_after=pose_rms_after,
             element_sets=element_sets,
+            photos=[kf.jpeg for kf in self.keyframes],
+            final_elements=final_elements,
         )
 
 

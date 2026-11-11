@@ -421,6 +421,7 @@ class GuidedCaptureDialog(QDialog):
         image = self.session.overview_image
         version = self.session.overview_version
         if image is None:
+            self.overview_label.setText("拍照阶段只记录位姿/覆盖，完成后统一拼接")
             return
         if version == self._thumb_version:
             return
