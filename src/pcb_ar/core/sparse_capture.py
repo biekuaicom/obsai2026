@@ -240,6 +240,8 @@ class SparseCaptureSession:
         self._last_frame: np.ndarray | None = None
         self._preview_frame: np.ndarray | None = None
         self._last_preview: CapturePreview | None = None
+        self._prev_preview_frame: np.ndarray | None = None
+        self._prev_preview_pose: np.ndarray | None = None
         self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         self._canvas: np.ndarray | None = None
         self._coverage_mask: np.ndarray | None = None
@@ -302,6 +304,8 @@ class SparseCaptureSession:
         self._last_frame = None
         self._preview_frame = None
         self._last_preview = None
+        self._prev_preview_frame = None
+        self._prev_preview_pose = None
         self._canvas = None
         self._coverage_mask = None
         self._coverage_distance = None
@@ -408,6 +412,34 @@ class SparseCaptureSession:
             best, global_good = self._match_preview_candidates(features, remaining[:6])
             best_good_count = max(best_good_count, global_good)
         if best is None:
+            # 关键帧暂时匹配不上时，用上一帧→当前帧的 ECC 运动预测红区位置。
+            # 不把红区清空：红色在板坐标系里是固定的，短时丢失不应导致锁定失效。
+            predicted = None
+            if self._prev_preview_frame is not None and self._prev_preview_pose is not None:
+                motion = self._frame_motion(self._prev_preview_frame, frame)
+                if motion is not None:
+                    predicted = as_homography(self._prev_preview_pose) @ motion
+            if predicted is not None:
+                preview.pose = predicted
+                red_mask = self._warp_coverage_to_view(
+                    predicted, frame.shape[1], frame.shape[0]
+                )
+                preview.coverage_polygons = []
+                preview.coverage_mask = red_mask
+                preview.red_metrics = compute_red_metrics(red_mask)
+                preview.covered_fraction = preview.red_metrics.area_fraction
+                preview.new_fraction = max(0.0, 1.0 - preview.covered_fraction)
+                preview.can_capture = False
+                preview.matches = best_good_count
+                preview.message = (
+                    f"未匹配关键帧，红区按运动预测锁定（{preview.covered_fraction:.0%}）；"
+                    "请回到红色重叠区再拍"
+                )
+                preview.reason = "motion_only"
+                self._prev_preview_frame = frame.copy()
+                self._prev_preview_pose = predicted
+                self._last_preview = preview
+                return preview
             self._clear_red_guard()
             preview.matches = best_good_count
             preview.message = (
@@ -420,6 +452,7 @@ class SparseCaptureSession:
         preview.matches = good_count
         preview.inliers = inliers
         pose_full = as_homography(matched_keyframe.pose) @ as_homography(matrix_full)
+        pose_full = self._stabilize_pose(pose_full, frame)
         preview.pose = pose_full
         # 红区直接从“板级覆盖 mask”warp 到当前画面，不再逐关键帧投影/布尔并集。
         # 这样预览耗时与已拍张数基本无关，也避免几十张 coverage 的路径并集变慢。
@@ -465,6 +498,8 @@ class SparseCaptureSession:
             # 清晰的覆盖 mask。这样正常换行/回到旧区域不会被误杀。
             if preview.can_capture:
                 preview.message += f"（红区面积/外形波动：{preview.red_warning}）"
+        self._prev_preview_frame = frame.copy()
+        self._prev_preview_pose = pose_full.copy()
         self._last_preview = preview
         return preview
 
@@ -1066,6 +1101,27 @@ class SparseCaptureSession:
         content = 0.7 * edge_score + 0.3 * max(0.0, corr)
         return float(max(0.0, min(1.0, content))), overlap_px
 
+    @staticmethod
+    def _transform_delta(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float]:
+        ma = np.asarray(a, dtype=np.float64)
+        mb = np.asarray(b, dtype=np.float64)
+        if ma.shape == (2, 3):
+            ma = np.vstack([ma, [0, 0, 1]])
+        if mb.shape == (2, 3):
+            mb = np.vstack([mb, [0, 0, 1]])
+        dt = float(np.linalg.norm(ma[:2, 2] - mb[:2, 2]))
+        da = abs(
+            math.degrees(
+                math.atan2(float(ma[1, 0]), float(ma[0, 0]))
+                - math.atan2(float(mb[1, 0]), float(mb[0, 0]))
+            )
+        )
+        da = min(da, 360.0 - da)
+        sa = math.sqrt(max(1e-9, abs(float(np.linalg.det(ma[:2, :2])))))
+        sb = math.sqrt(max(1e-9, abs(float(np.linalg.det(mb[:2, :2])))))
+        ds = abs(sa / max(sb, 1e-9) - 1.0)
+        return dt, da, ds
+
     def _estimate_keyframe_pose(
         self,
         features: FeatureSet,
@@ -1132,17 +1188,22 @@ class SparseCaptureSession:
             element_inliers = 0
             if elements is not None and kf.elements is not None:
                 element_match = match_elements(kf.elements, elements, matrix)
-                if element_match.ok and element_match.matrix is not None:
-                    matrix = element_match.matrix
-                    element_inliers = element_match.inliers
+                # 元素匹配只能做“小幅二次校正”，不能直接覆盖 ORB 的全局位姿。
+                # 重复焊盘/孔很容易形成 6 个错误对应；一旦大范围改写矩阵，
+                # 板边会整体错开，这正是 v0.8.0 的回归风险。
+                if element_match.ok and element_match.matrix is not None and element_match.kinds >= 2:
+                    dt, da, ds = self._transform_delta(matrix, element_match.matrix)
+                    if dt <= 6.0 and da <= 0.8 and ds <= 0.02:
+                        matrix = element_match.matrix
+                        element_inliers = element_match.inliers
             pose = as_homography(kf.pose) @ as_homography(matrix)
             if not is_valid_similarity(pose):
                 continue
             content, overlap_px = self._overlap_content_score(features.image, kf, matrix)
-            # 内点只是候选；元素对齐 + 重叠区真实边缘/灰度核对才算数。
-            score = (inliers + 1.5 * element_inliers) * (0.65 + 1.35 * content)
-            if content < 0.06 and overlap_px > 10000:
-                score *= 0.45
+            # ORB 内点是主判据；内容/元素只做验证和轻微加分，避免“内容分高但位姿错”。
+            score = inliers * (0.9 + 0.2 * content) + 0.5 * element_inliers
+            if content < 0.18 and overlap_px > 10000:
+                score *= 0.5
             if score > best_score:
                 best_pose = pose
                 best_matches = len(good)
@@ -1159,6 +1220,83 @@ class SparseCaptureSession:
             best_content,
             best_element_inliers,
         )
+
+    def _frame_motion(
+        self,
+        previous: np.ndarray,
+        current: np.ndarray,
+    ) -> np.ndarray | None:
+        """用 ECC 估计上一帧→当前帧的小运动；用于红区锁定/短时丢失预测。"""
+        if previous is None or current is None or previous.shape != current.shape:
+            return None
+        h, w = previous.shape[:2]
+        scale = min(1.0, 640.0 / float(max(h, w)))
+        if scale < 0.999:
+            size = (max(64, int(w * scale)), max(64, int(h * scale)))
+            prev_small = cv2.resize(previous, size, interpolation=cv2.INTER_AREA)
+            cur_small = cv2.resize(current, size, interpolation=cv2.INTER_AREA)
+        else:
+            prev_small, cur_small = previous, current
+        pg = cv2.cvtColor(prev_small, cv2.COLOR_BGR2GRAY)
+        cg = cv2.cvtColor(cur_small, cv2.COLOR_BGR2GRAY)
+        pe = cv2.dilate(cv2.Canny(pg, 35, 110), np.ones((3, 3), np.uint8))
+        ce = cv2.dilate(cv2.Canny(cg, 35, 110), np.ones((3, 3), np.uint8))
+        try:
+            cc, warp = cv2.findTransformECC(
+                pe.astype(np.float32),
+                ce.astype(np.float32),
+                np.eye(2, 3, dtype=np.float32),
+                cv2.MOTION_EUCLIDEAN,
+                (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 1e-4),
+                None,
+                5,
+            )
+        except cv2.error:
+            return None
+        if not np.isfinite(cc) or cc < 0.05:
+            return None
+        # findTransformECC 返回 current→previous，取逆得到 previous→current。
+        h_w = np.vstack([warp, [0.0, 0.0, 1.0]]).astype(np.float64)
+        try:
+            motion_small = np.linalg.inv(h_w)
+        except np.linalg.LinAlgError:
+            return None
+        s = np.diag([scale, scale, 1.0])
+        motion = np.linalg.inv(s) @ motion_small @ s
+        return motion.astype(np.float64)
+
+    @staticmethod
+    def _blend_pose(previous: np.ndarray, current: np.ndarray, current_weight: float = 0.45) -> np.ndarray:
+        """在相似变换空间做短时平滑，抑制红区边缘高频抖动。"""
+        pa = as_homography(previous)
+        pb = as_homography(current)
+        ta = pa[:2, 2]
+        tb = pb[:2, 2]
+        aa = math.atan2(float(pa[1, 0]), float(pa[0, 0]))
+        ab = math.atan2(float(pb[1, 0]), float(pb[0, 0]))
+        da = (ab - aa + math.pi) % (2 * math.pi) - math.pi
+        sa = math.sqrt(max(1e-9, abs(float(np.linalg.det(pa[:2, :2])))))
+        sb = math.sqrt(max(1e-9, abs(float(np.linalg.det(pb[:2, :2])))))
+        w = float(np.clip(current_weight, 0.0, 1.0))
+        t = ta * (1.0 - w) + tb * w
+        a = aa + da * w
+        s = math.exp(math.log(sa) * (1.0 - w) + math.log(sb) * w)
+        c, sn = math.cos(a), math.sin(a)
+        return np.array(
+            [[s * c, -s * sn, t[0]], [s * sn, s * c, t[1]], [0, 0, 1]], dtype=np.float64
+        )
+
+    def _stabilize_pose(self, pose: np.ndarray, frame: np.ndarray) -> np.ndarray:
+        if self._prev_preview_pose is None or self._prev_preview_frame is None:
+            return pose
+        motion = self._frame_motion(self._prev_preview_frame, frame)
+        if motion is None:
+            return pose
+        predicted = as_homography(self._prev_preview_pose) @ motion
+        dt, da, ds = self._transform_delta(pose, predicted)
+        if dt <= 15.0 and da <= 2.5 and ds <= 0.03:
+            return self._blend_pose(predicted, pose, 0.55)
+        return pose
 
     # ------------------------------------------------------------------ 拍摄
     def capture(self) -> CaptureAcceptance:

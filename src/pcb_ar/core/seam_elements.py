@@ -94,6 +94,7 @@ class ElementMatch:
     matrix: np.ndarray | None
     inliers: int
     confidence: float
+    kinds: int = 0
     message: str = ""
 
 
@@ -261,12 +262,12 @@ def match_elements(
     min_inliers: int = 6,
 ) -> ElementMatch:
     if not reference.elements or not query.elements:
-        return ElementMatch(False, None, 0, 0.0, "无元素")
+        return ElementMatch(False, None, 0, 0.0, message="无元素")
     diag = math.hypot(reference.width, reference.height)
     tolerance = max(12.0, diag * 0.055)
     pairs = _candidate_pairs(reference, query, initial, tolerance)
     if len(pairs) < min_inliers:
-        return ElementMatch(False, None, len(pairs), 0.0, "元素对应不足")
+        return ElementMatch(False, None, len(pairs), 0.0, message="元素对应不足")
     used_q: set[int] = set()
     used_r: set[int] = set()
     src: list[tuple[float, float]] = []
@@ -283,7 +284,7 @@ def match_elements(
         if len(src) >= 80:
             break
     if len(src) < min_inliers:
-        return ElementMatch(False, None, len(src), 0.0, "元素对应不足")
+        return ElementMatch(False, None, len(src), 0.0, message="元素对应不足")
     src_arr = np.float32(src).reshape(-1, 1, 2)
     dst_arr = np.float32(dst).reshape(-1, 1, 2)
     matrix, mask = cv2.estimateAffinePartial2D(
@@ -295,10 +296,10 @@ def match_elements(
         confidence=0.997,
     )
     if matrix is None or mask is None:
-        return ElementMatch(False, None, 0, 0.0, "元素 RANSAC 失败")
+        return ElementMatch(False, None, 0, 0.0, message="元素 RANSAC 失败")
     inliers = int(np.count_nonzero(mask))
     if inliers < min_inliers:
-        return ElementMatch(False, None, inliers, 0.0, "元素内点不足")
+        return ElementMatch(False, None, inliers, 0.0, message="元素内点不足")
     h = np.vstack([matrix, [0.0, 0.0, 1.0]]).astype(np.float64)
     confidence = min(1.0, inliers / max(6.0, min(len(src), 14) * 0.75))
     return ElementMatch(
@@ -306,5 +307,6 @@ def match_elements(
         h,
         inliers,
         float(confidence),
+        len(kinds),
         f"元素对齐 {inliers} 个 / {len(kinds)} 类",
     )
