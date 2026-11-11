@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 )
 
 from pcb_ar.core.grid_stitcher import GridStitchResult, stitch_grid_folder
+from pcb_ar.core.overlap_stitcher import OverlapResult, stitch_overlap_grid
 from pcb_ar.core.imageio import write_image
 from pcb_ar.core.photo_stitcher import PhotoStitchResult, stitch_photo_folder
 from pcb_ar.ui.qt_utils import qimage_from_bgr
@@ -46,6 +47,15 @@ class _StitchThread(QThread):
         try:
             if self.method == "grid":
                 result = stitch_grid_folder(
+                    self.files,
+                    rows=self.rows,
+                    cols=self.cols,
+                    serpentine=self.serpentine,
+                    overlap=self.overlap,
+                    max_side=2600,
+                )
+            elif self.method == "overlap":
+                result = stitch_overlap_grid(
                     self.files,
                     rows=self.rows,
                     cols=self.cols,
@@ -87,7 +97,8 @@ class GridStitchDialog(QDialog):
         options = QHBoxLayout()
         options.addWidget(QLabel("方式"))
         self.method = QComboBox()
-        self.method.addItem("坐标网格（推荐）", "grid")
+        self.method.addItem("C区锚点（推荐）", "overlap")
+        self.method.addItem("坐标网格", "grid")
         self.method.addItem("自动鲁棒（实验）", "auto")
         options.addWidget(self.method)
         options.addWidget(QLabel("行"))
