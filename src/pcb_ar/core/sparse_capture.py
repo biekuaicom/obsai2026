@@ -29,6 +29,7 @@ from pcb_ar.core.sparse_map import (
     extract_features,
 )
 from pcb_ar.core.pose_graph import build_pose_edges, optimize_poses
+from pcb_ar.core.seam_elements import ElementSet, extract_elements, match_elements
 from pcb_ar.core.structural_map import (
     StructuralMap,
     StructuralMatch,
@@ -195,6 +196,8 @@ class CapturedKeyframe:
     inliers: int = 0
     pose_source: int = -1
     content_score: float = 0.0
+    elements: ElementSet | None = None
+    element_inliers: int = 0
     seam_applied: bool = False
     seam_cc: float = 0.0
     seam_shift_px: float = 0.0
@@ -224,6 +227,7 @@ class SparseCaptureResult:
     loop_closures: int = 0
     pose_rms_before: float = 0.0
     pose_rms_after: float = 0.0
+    element_sets: list[ElementSet] = field(default_factory=list)
 
 
 class SparseCaptureSession:
@@ -1068,7 +1072,8 @@ class SparseCaptureSession:
         preview: CapturePreview,
         frame_width: int,
         frame_height: int,
-    ) -> tuple[np.ndarray | None, int, int, int, float]:
+        elements: ElementSet | None = None,
+    ) -> tuple[np.ndarray | None, int, int, int, float, int]:
         """用所有可能重叠的旧关键帧估计新关键帧位姿，降低逐张累加漂移。
 
         返回 (pose_new->scan_world, matches, inliers, source_keyframe_index)。
@@ -1091,6 +1096,7 @@ class SparseCaptureSession:
         best_inliers = 0
         best_index = -1
         best_content = 0.0
+        best_element_inliers = 0
         best_score = -1.0
         for kf in candidates:
             if kf.descriptors.size == 0:
@@ -1123,12 +1129,18 @@ class SparseCaptureSession:
             inliers = int(np.count_nonzero(mask))
             if inliers < self.config.min_inliers:
                 continue
+            element_inliers = 0
+            if elements is not None and kf.elements is not None:
+                element_match = match_elements(kf.elements, elements, matrix)
+                if element_match.ok and element_match.matrix is not None:
+                    matrix = element_match.matrix
+                    element_inliers = element_match.inliers
             pose = as_homography(kf.pose) @ as_homography(matrix)
             if not is_valid_similarity(pose):
                 continue
             content, overlap_px = self._overlap_content_score(features.image, kf, matrix)
-            # 内点只是候选；重叠区真实边缘/灰度核对才算数。
-            score = inliers * (0.65 + 1.35 * content)
+            # 内点只是候选；元素对齐 + 重叠区真实边缘/灰度核对才算数。
+            score = (inliers + 1.5 * element_inliers) * (0.65 + 1.35 * content)
             if content < 0.06 and overlap_px > 10000:
                 score *= 0.45
             if score > best_score:
@@ -1137,8 +1149,16 @@ class SparseCaptureSession:
                 best_inliers = inliers
                 best_index = kf.index
                 best_content = content
+                best_element_inliers = element_inliers
                 best_score = score
-        return best_pose, best_matches, best_inliers, best_index, best_content
+        return (
+            best_pose,
+            best_matches,
+            best_inliers,
+            best_index,
+            best_content,
+            best_element_inliers,
+        )
 
     # ------------------------------------------------------------------ 拍摄
     def capture(self) -> CaptureAcceptance:
@@ -1164,16 +1184,28 @@ class SparseCaptureSession:
             return CaptureAcceptance(False, f"关键帧特征提取失败：{exc}")
         if features.descriptors.size < self.config.min_inliers:
             return CaptureAcceptance(False, "关键帧特征不足，请对准纹理更丰富的区域")
+        try:
+            elements = extract_elements(features.image)
+        except Exception:  # noqa: BLE001
+            elements = None
         pose_source = -1
         pose_matches = 0
         pose_inliers = 0
         pose_content = 0.0
+        pose_element_inliers = 0
         if self.keyframes:
             if preview.pose is None:
                 return CaptureAcceptance(False, "没有可用的位置关系，请回退后重试")
             # 优先与“覆盖当前视场的较老关键帧”匹配，避免只能相对上一张累加。
-            pose_kf, pose_matches, pose_inliers, pose_source, pose_content = self._estimate_keyframe_pose(
-                features, preview, frame.shape[1], frame.shape[0]
+            (
+                pose_kf,
+                pose_matches,
+                pose_inliers,
+                pose_source,
+                pose_content,
+                pose_element_inliers,
+            ) = self._estimate_keyframe_pose(
+                features, preview, frame.shape[1], frame.shape[0], elements
             )
             if pose_kf is None:
                 # preview.pose: full live -> scan world
@@ -1209,6 +1241,8 @@ class SparseCaptureSession:
             inliers=pose_inliers,
             pose_source=pose_source,
             content_score=pose_content,
+            elements=elements,
+            element_inliers=pose_element_inliers,
         )
         self.keyframes.append(record)
         try:
@@ -1238,6 +1272,8 @@ class SparseCaptureSession:
             suffix = f"；板边对齐 {record.seam_shift_px:.1f}px"
         if record.content_score > 0:
             suffix += f"；重叠内容核对 {record.content_score:.0%}"
+        if record.element_inliers > 0:
+            suffix += f"；元素对齐 {record.element_inliers} 个"
         message = (
             "已拍摄第一张并立即并入总览，请移动到相邻区域并保留一部分红色覆盖"
             if len(self.keyframes) == 1
@@ -1259,6 +1295,7 @@ class SparseCaptureSession:
         loop_closures = 0
         pose_rms_before = 0.0
         pose_rms_after = 0.0
+        element_sets = [kf.elements for kf in self.keyframes if kf.elements is not None]
         if progress:
             progress(0, 5, "位姿图/回环检查…")
         if self.config.pose_graph_optimize and len(self.keyframes) >= 3:
@@ -1386,6 +1423,7 @@ class SparseCaptureSession:
             loop_closures=loop_closures,
             pose_rms_before=pose_rms_before,
             pose_rms_after=pose_rms_after,
+            element_sets=element_sets,
         )
 
 

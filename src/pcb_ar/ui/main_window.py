@@ -1,6 +1,7 @@
 """主窗口：工程、实时画面、AR 标注、核对与扫描建图入口。"""
 from __future__ import annotations
 
+import json
 import logging
 import time
 import traceback
@@ -1436,6 +1437,20 @@ class MainWindow(QMainWindow):
                     f"{result.loop_closures} 回环 / "
                     f"RMS {result.pose_rms_before:.3f}→{result.pose_rms_after:.3f}"
                 )
+            element_total = 0
+            if result.element_sets:
+                manifest_path = store.assets_dir / "elements_manifest.json"
+                data = {
+                    "keyframes": [
+                        {"index": i, **es.to_dict()} for i, es in enumerate(result.element_sets)
+                    ]
+                }
+                manifest_path.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                element_total = sum(len(es.elements) for es in result.element_sets)
+                structure_text += f"；元素签名：{element_total} 个"
             store.project.notes = (
                 f"由轻量引导捕获生成：{result.keyframe_count} 个关键帧{structure_text}。"
                 "稀疏关键帧定位为默认，低分辨率总览用于全图增强/人工查看。"

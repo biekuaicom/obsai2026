@@ -65,6 +65,8 @@ def test_sparse_capture_result(sparse_bundle):
     assert result.structural_map is not None
     assert result.structural_map.component_count > 0
     assert result.structural_match is not None
+    assert result.element_sets
+    assert any(es.elements for es in result.element_sets)
 
 
 def test_sparse_localization_accuracy(board, sparse_bundle):

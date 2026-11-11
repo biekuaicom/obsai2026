@@ -2,7 +2,7 @@
 
 面向“摄像头固定在 PCB 正上方、显微镜手动平移/旋转”的桌面工具。默认流程已从“生成完整大拼图”改为 **轻量引导捕获 + 稀疏关键帧地图 + 全图周期校验**：只保存关键帧、ORB/边缘特征、位姿和覆盖区域；全图能力作为可选增强与备用。
 
-> 版本：0.7.0（默认轻量建图；尚未经过真实 800 万像素显微硬件验收）
+> 版本：0.8.0（默认轻量建图；尚未经过真实 800 万像素显微硬件验收）
 >
 > 运行环境：Windows 10/11 x64 · Python 3.12（源码）· 便携版无需安装 Python
 >
@@ -25,6 +25,7 @@
 - **接缝源选择**：重叠区不再平均两张图，而是每个像素选“离自己图像边缘更远”的那张，同一文字/引脚只保留一个来源；加入重叠区曝光补偿和最终重渲染 ECC。
 - **位姿图 + 回环闭合**：完成时对关键帧做相邻边 + 全局描述子回环候选 + ORB 验证；有回环才做相似变换位姿图优化并重渲染总览，减少第 5~9 行的累积漂移。
 - **重叠内容核对**：候选位姿不仅看 ORB 内点，还在重叠区核对 Canny 边缘命中率和灰度相关；文本、焊盘、孔、引脚、走线、色块都会参与，避免“内点高但实际对不上”。
+- **元素分离与签名**：每张关键帧提取元件/焊盘/孔/文本/走线/色块元素，保存 bbox/中心/尺寸/方向/颜色/局部描述子；元素对应做 RANSAC 二次校正，并输出 `elements_manifest.json`，为后续小图块识别准备数据。
 - **局部优先匹配**：正常只尝试上一张 + 最近 4 张；局部全部失败才按全局描述子回退最多 6 张，避免几十张图全部参与判断。
 - **红区面积/外形记忆**：每次拍摄记录红区面积、连通域、bbox、外形 Hu/IoU；异常只做提示，不直接阻断拍摄，避免正常换行被误杀。
 - **结构特征树 B1**：整图完成后提取元件、焊盘、定位孔、长走线等稳定基元，保存尺寸/长宽比/方向和相对距离/角度关系图到 `structural_map.json`；为后续多组件结构匹配提供数据。
@@ -44,13 +45,13 @@
 
 ### 方式 A：打包版（推荐给现场）
 
-1. 解压 `dist/PCB_AR_Annotator_v0.7.0_win64.zip`。
+1. 解压 `dist/PCB_AR_Annotator_v0.8.0_win64.zip`。
 2. 双击 `PCB_AR_Annotator.exe`。
 3. 首次启动自动生成演示工程；移动/旋转时标注应吸附在元件上。
 4. 点击「轻量扫描建图…」体验新的默认流程；需要整图时用「输入 → 全图扫描（备用/增强）」。
 5. 详见 [使用指南](docs/03_使用指南.md)。
 
-> Windows SmartScreen 可能提示未知发布者（未签名）。选择“更多信息 → 仍要运行”。正式交付建议做代码签名。v0.7.0 本机包：onedir 约 218 MB，zip 约 86 MB。
+> Windows SmartScreen 可能提示未知发布者（未签名）。选择“更多信息 → 仍要运行”。正式交付建议做代码签名。v0.8.0 本机包：onedir 约 218 MB，zip 约 86 MB。
 
 ### 方式 B：源码
 
@@ -140,6 +141,7 @@ src/pcb_ar/
     board_rectify.py    # 板体外轮廓检测 + 单应拉正
     structural_map.py   # 元件/焊盘/定位孔/走线基元 + 相对关系图
     pose_graph.py       # 相邻边 + 回环 + 相似变换位姿图优化
+    seam_elements.py    # 文本/焊盘/孔/元件/走线/色块元素分离与对齐
     video_scan.py       # 原连续视频全图扫描（备用）
     stitcher.py         # 总览/散图渲染
     detector.py         # 候选检测 + 可选 YOLO
@@ -150,7 +152,7 @@ src/pcb_ar/
     scan_dialog.py            # 全图扫描备用工作台
     main_window.py / overlay.py / sidebar.py / ...
   selftest.py
-tests/                  # 37 项自动化测试
+tests/                  # 38 项自动化测试
 docs/                   # 架构/算法/使用/开发/打包/测试/虚拟环境
 packaging/              # PyInstaller spec、图标、版本信息
 scripts/                # 环境、运行、测试、打包、GitHub 同步
@@ -160,7 +162,7 @@ scripts/                # 环境、运行、测试、打包、GitHub 同步
 
 | 项目 | 结果 |
 |---|---|
-| pytest | 37 passed |
+| pytest | 38 passed |
 | 轻量捕获 | 3 个关键帧逐张合并为增量总览；ECC 边缘对齐 0.1~0.3px；收尾约 0.02 s |
 | 稀疏定位 | 合成板连续帧锁定，四角误差约 0.1~0.2 px（短序列） |
 | 稀疏单帧耗时 | 约 50~60 ms（1600×1000 输入，工作宽 1200） |
@@ -190,7 +192,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
 产物：
 
 - `dist/PCB_AR_Annotator/PCB_AR_Annotator.exe`
-- `dist/PCB_AR_Annotator_v0.7.0_win64.zip`
+- `dist/PCB_AR_Annotator_v0.8.0_win64.zip`
 - `artifacts/packaged_selftest.json`、`artifacts/packaged_demo.png`
 - `dist/CHECKSUMS.txt`
 
@@ -210,6 +212,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
 - [轻量稀疏建图设计](docs/10_轻量稀疏建图设计.md)
 - [虚拟环境与依赖](docs/11_虚拟环境与依赖.md)
 - [结构特征树与覆盖可信度](docs/12_结构特征树与覆盖可信度.md)
+- [元素分离与拼接签名](docs/13_元素分离与拼接签名.md)
 - [第三方许可说明](THIRD_PARTY_NOTICES.md)
 - [GPL-3.0 许可证](LICENSE)
 
