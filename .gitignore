@@ -1,4 +1,4 @@
-# Python 虚拟环境：开源仓库不提交平台相关的 .venv
+﻿# Python 铏氭嫙鐜锛氬紑婧愪粨搴撲笉鎻愪氦骞冲彴鐩稿叧鐨?.venv
 .venv/
 venv/
 env/
@@ -10,13 +10,12 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# 构建产物与本机运行产物
-build/
+# 鏋勫缓浜х墿涓庢湰鏈鸿繍琛屼骇鐗?build/
 dist/
 artifacts/
 *.spec.bak
 
-# 本机工程/日志/缓存
+# 鏈満宸ョ▼/鏃ュ織/缂撳瓨
 demo_runtime/
 *.log
 *.pcbproj.json.bak
@@ -25,7 +24,9 @@ demo_runtime/
 *.token
 *.pem
 
-# 编辑器
-.idea/
+# 缂栬緫鍣?.idea/
 .vscode/
 .DS_Store
+001/
+captures/
+build/
