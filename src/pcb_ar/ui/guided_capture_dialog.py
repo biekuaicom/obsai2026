@@ -9,7 +9,18 @@ from typing import Callable
 import cv2
 import numpy as np
 from PyQt6.QtCore import QPointF, QRectF, QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
+from PyQt6.QtCore import QUrl
+from PyQt6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QFont,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygonF,
+)
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -25,6 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from pcb_ar.core.imageio import write_image
+from pcb_ar.paths import default_project_dir
 from pcb_ar.core.sparse_capture import (
     CapturePreview,
     SparseCaptureError,
@@ -187,7 +199,8 @@ class GuidedCaptureDialog(QDialog):
         self.setModal(True)
         self.resize(1240, 850)
         self.frame_provider = frame_provider
-        self.session = SparseCaptureSession()
+        self.photo_dir = default_project_dir() / "captures" / time.strftime("guided_%Y%m%d-%H%M%S")
+        self.session = SparseCaptureSession(photo_dir=self.photo_dir)
         self.result: SparseCaptureResult | None = None
         self._running = False
         self._first_auto_done = False
@@ -289,6 +302,9 @@ class GuidedCaptureDialog(QDialog):
         buttons.addWidget(self.capture_button, 2)
         right.addLayout(buttons)
         right.addWidget(self.finish_button)
+        self.open_photos_button = QPushButton("打开拍照文件夹")
+        self.open_photos_button.clicked.connect(self.open_photos_folder)
+        right.addWidget(self.open_photos_button)
         right.addWidget(self.cancel_button)
 
         self.progress = QProgressBar()
@@ -555,6 +571,10 @@ class GuidedCaptureDialog(QDialog):
             thread.deleteLater()
         self._build_thread = None
         self._update_buttons()
+
+    def open_photos_folder(self) -> None:
+        self.photo_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.photo_dir)))
 
     def export_overview(self) -> None:
         if self.result is None:

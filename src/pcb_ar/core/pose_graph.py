@@ -214,8 +214,25 @@ def build_pose_edges(keyframes: list[Any], *, max_loops: int = 1) -> list[PoseEd
         )
         if matrix is not None:
             edges.append(PoseEdge(i, i + 1, matrix, inliers, loop=False))
-    # 回环候选：全局描述子最相近的非相邻帧，再做 ORB 验证。
+    # 局部非相邻边：类似全景的短基线 bundle adjustment，给链式相邻边增加
+    # 2~4 张之内的交叉约束，减少逐张累加漂移。
     used: set[tuple[int, int]] = {(min(e.i, e.j), max(e.i, e.j)) for e in edges}
+    for i in range(n):
+        for j in range(i + 2, min(n, i + 5)):
+            if (i, j) in used:
+                continue
+            matrix, inliers = _match_pair(
+                keyframes[i].keypoints,
+                keyframes[i].descriptors,
+                keyframes[j].keypoints,
+                keyframes[j].descriptors,
+                min_inliers=20,
+            )
+            if matrix is None:
+                continue
+            edges.append(PoseEdge(i, j, matrix, inliers, loop=False))
+            used.add((i, j))
+    # 回环候选：全局描述子最相近的非相邻帧，再做 ORB 验证。
     for i, kf in enumerate(keyframes):
         candidates = []
         for j in range(i + 3, n):

@@ -11,8 +11,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QByteArray, QPointF, QRectF, QSize, Qt, QTimer
-from PyQt6.QtGui import QAction, QColor, QKeySequence
+from PyQt6.QtCore import QByteArray, QPointF, QRectF, QSize, Qt, QTimer, QUrl
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -192,6 +192,11 @@ class MainWindow(QMainWindow):
             self.export_board_image,
             tip="把当前工程的总览图导出为 PNG/JPEG",
         )
+        self.action_open_photos = self._action(
+            "打开拍照文件夹",
+            self.open_photos_folder,
+            tip="在资源管理器中打开工程 assets/photos",
+        )
         self.action_export_photos = self._action(
             "导出拍照文件夹…",
             self.export_photos_folder,
@@ -250,6 +255,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.action_import_bom)
         file_menu.addAction(self.action_export_board)
+        file_menu.addAction(self.action_open_photos)
         file_menu.addAction(self.action_export_photos)
         file_menu.addAction(self.action_export_bom)
         file_menu.addSeparator()
@@ -827,6 +833,7 @@ class MainWindow(QMainWindow):
             self.action_save_as,
             self.action_import_bom,
             self.action_export_board,
+            self.action_open_photos,
             self.action_export_photos,
             self.action_export_bom,
             self.action_detect,
@@ -1353,6 +1360,15 @@ class MainWindow(QMainWindow):
         write_image(target, self.global_image)
         self.statusBar().showMessage(f"整张板图已导出：{target}", 5000)
         return target
+
+    def open_photos_folder(self) -> None:
+        if self.store is None:
+            return
+        folder = self.store.assets_dir / "photos"
+        if not folder.exists():
+            QMessageBox.information(self, "没有照片", "当前工程还没有保存局部照片。")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def export_photos_folder(self) -> None:
         if self.project is None or self.store is None:

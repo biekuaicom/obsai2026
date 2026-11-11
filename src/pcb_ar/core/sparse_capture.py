@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 import cv2
@@ -236,8 +237,15 @@ class SparseCaptureResult:
 
 
 class SparseCaptureSession:
-    def __init__(self, config: SparseCaptureConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: SparseCaptureConfig | None = None,
+        photo_dir: str | Path | None = None,
+    ) -> None:
         self.config = config or SparseCaptureConfig()
+        self.photo_dir = Path(photo_dir) if photo_dir is not None else None
+        if self.photo_dir is not None:
+            self.photo_dir.mkdir(parents=True, exist_ok=True)
         self.keyframes: list[CapturedKeyframe] = []
         self._prev_stability_gray: np.ndarray | None = None
         self._prev_stability_size: tuple[int, int] | None = None
@@ -1489,6 +1497,12 @@ class SparseCaptureSession:
         )
         if not ok:
             return CaptureAcceptance(False, "关键帧编码失败")
+        jpeg_bytes = buffer.tobytes()
+        if self.photo_dir is not None:
+            try:
+                (self.photo_dir / f"kf_{len(self.keyframes):03d}.jpg").write_bytes(jpeg_bytes)
+            except OSError:
+                pass
         record = CapturedKeyframe(
             index=len(self.keyframes),
             shape=(h, w),
@@ -1497,7 +1511,7 @@ class SparseCaptureSession:
             keypoints=features.keypoints,
             descriptors=features.descriptors,
             global_descriptor=features.global_descriptor,
-            jpeg=buffer.tobytes(),
+            jpeg=jpeg_bytes,
             timestamp=time.time(),
             red_metrics=preview.red_metrics,
             matches=pose_matches,
@@ -1570,7 +1584,8 @@ class SparseCaptureSession:
                 )
                 pose_graph_edges = len(edges)
                 loop_closures = sum(1 for e in edges if e.loop)
-                if loop_closures >= self.config.pose_graph_min_loops:
+                enough_local_edges = pose_graph_edges >= len(self.keyframes)
+                if loop_closures >= self.config.pose_graph_min_loops or enough_local_edges:
                     graph = optimize_poses([kf.pose for kf in self.keyframes], edges)
                     pose_rms_before = graph.rms_before
                     pose_rms_after = graph.rms_after
