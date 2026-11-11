@@ -54,6 +54,7 @@ from pcb_ar.core.synthetic import create_demo_project
 from pcb_ar.core.tracker import GlobalLocalTracker, TrackerConfig, TrackResult, pose_corner_error
 from pcb_ar.core.video import CameraSource, FrameData, SyntheticMicroscopeSource, VideoFileSource
 from pcb_ar.paths import default_project_dir, demo_dir
+from pcb_ar.ui.grid_stitch_dialog import GridStitchDialog
 from pcb_ar.ui.guided_capture_dialog import GuidedCaptureDialog
 from pcb_ar.ui.inline_editor import InlineParamEditor
 from pcb_ar.ui.live import LiveWorker
@@ -210,6 +211,11 @@ class MainWindow(QMainWindow):
         self.action_video = self._action("视频文件…", self.open_video_file, tip="使用录制好的显微镜视频")
         self.action_pause = self._action("暂停", self.toggle_pause, "F5", checkable=True, tip="暂停/继续实时采集")
 
+        self.action_grid_stitch = self._action(
+            "照片文件夹网格拼接…",
+            self.open_grid_stitch,
+            tip="把已拍好的局部照片按行列/重叠重新拼成完整图",
+        )
         self.action_guided_scan = self._action(
             "轻量扫描建图…",
             self.open_guided_capture,
@@ -253,6 +259,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.action_save)
         file_menu.addAction(self.action_save_as)
         file_menu.addSeparator()
+        file_menu.addAction(self.action_grid_stitch)
         file_menu.addAction(self.action_import_bom)
         file_menu.addAction(self.action_export_board)
         file_menu.addAction(self.action_open_photos)
@@ -1360,6 +1367,9 @@ class MainWindow(QMainWindow):
         write_image(target, self.global_image)
         self.statusBar().showMessage(f"整张板图已导出：{target}", 5000)
         return target
+
+    def open_grid_stitch(self) -> None:
+        GridStitchDialog(self).exec()
 
     def open_photos_folder(self) -> None:
         if self.store is None:
