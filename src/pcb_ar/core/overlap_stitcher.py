@@ -226,19 +226,15 @@ def stitch_overlap_grid(
     scale = min(1.0, max_side / float(max(span)))
     W, H = int(span[0] * scale), int(span[1] * scale)
     canvas = np.zeros((H, W, 3), np.uint8)
-    best = np.zeros((H, W), np.float32)
-    for im, p, mask in zip(images, poses, masks):
+    for im, p in zip(images, poses):
         M = np.array([[scale, 0, -lo[0] * scale], [0, scale, -lo[1] * scale], [0, 0, 1]]) @ p
         warped = cv2.warpAffine(im, M[:2].astype(np.float32), (W, H), flags=cv2.INTER_AREA)
-        wm = cv2.warpAffine(mask, M[:2].astype(np.float32), (W, H), flags=cv2.INTER_NEAREST) > 0
-        if not wm.any():
-            continue
-        x, y, ww, hh = cv2.boundingRect(wm.astype(np.uint8))
-        dist = np.zeros((H, W), np.float32)
-        dist[y : y + hh, x : x + ww] = cv2.distanceTransform(
-            wm[y : y + hh, x : x + ww].astype(np.uint8), cv2.DIST_L2, 5
-        )
-        better = wm & (dist > best + 0.3)
-        canvas[better] = warped[better]
-        best = np.maximum(best, dist)
+        # 合成用完整矩形，不用板面 mask 切接缝。
+        # 后放的图确定性地覆盖前一张；每个覆盖像素都写入，不做距离阈值跳像素。
+        valid = np.full(im.shape[:2], 255, dtype=np.uint8)
+        wm = cv2.warpAffine(
+            valid, M[:2].astype(np.float32), (W, H),
+            flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        ) > 0
+        canvas[wm] = warped[wm]
     return OverlapResult(canvas, f"{len(edges)} C区边 / RMS {rms:.2f}", len(edges), rms)

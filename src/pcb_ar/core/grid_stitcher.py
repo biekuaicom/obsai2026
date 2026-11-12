@@ -232,10 +232,9 @@ def stitch_grid_folder(
                 images[idx], matrix[:2].astype(np.float32), (width, height),
                 flags=cv2.INTER_AREA, borderMode=cv2.BORDER_CONSTANT,
             )
-            # 只修剪物理外边缘 2px（坏边），不切重叠区内部。
-            footprint = np.zeros(image.shape[:2], dtype=np.uint8)
-            b = 2
-            footprint[b : image.shape[0] - b, b : image.shape[1] - b] = 255
+            # 合成用完整矩形：不在每张图上修边，避免 A 修右边、B 修左边
+            # 导致接缝中间少一列。物理外边缘留给最终输出统一处理。
+            footprint = np.full(image.shape[:2], 255, dtype=np.uint8)
             fmask = cv2.warpAffine(
                 footprint, matrix[:2].astype(np.float32), (width, height),
                 flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
