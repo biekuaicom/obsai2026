@@ -80,6 +80,80 @@ def _refine_pair(
     return previous_pos[0] + dx + shift_x, previous_pos[1] + dy + shift_y
 
 
+def _calibrate_grid(cells, images, dx: float, dy: float) -> None:
+    """用 C 区相位相关求“整行/整列”的偏移量，补偿红色覆盖与实际步长的容差。
+
+    模型：
+      X(r,c) = c*dx + ColX[c] + RowX[r]
+      Y(r,c) = r*dy + RowY[r] + ColY[c]
+    只修正整行/整列，不把每张图自由乱拖。
+    """
+    by_row = {}
+    by_col = {}
+    for t in cells:
+        by_row.setdefault(t[1], []).append(t)
+        by_col.setdefault(t[2], []).append(t)
+    # 行内相邻：测列方向偏移
+    colx: dict[int, list[float]] = {}
+    coly: dict[int, list[float]] = {}
+    for r, items in by_row.items():
+        items.sort(key=lambda t: t[3][0])
+        for left, right in zip(items, items[1:]):
+            expected = (float(dx), 0.0)
+            refined = _refine_pair(
+                images[left[0]], images[right[0]], expected,
+                (float(left[3][0]), float(left[3][1])),
+            )
+            if refined is None:
+                continue
+            meas_dx = refined[0] - float(left[3][0])
+            meas_dy = refined[1] - float(left[3][1])
+            c0, c1 = left[2], right[2]
+            colx.setdefault(c0, []).append(0.0)
+            colx.setdefault(c1, []).append(meas_dx - dx)
+            coly.setdefault(c0, []).append(0.0)
+            coly.setdefault(c1, []).append(meas_dy)
+    # 列内相邻：测行方向偏移
+    rowx: dict[int, list[float]] = {}
+    rowy: dict[int, list[float]] = {}
+    for c, items in by_col.items():
+        items.sort(key=lambda t: t[3][1])
+        for top, bottom in zip(items, items[1:]):
+            expected = (0.0, float(dy))
+            refined = _refine_pair(
+                images[top[0]], images[bottom[0]], expected,
+                (float(top[3][0]), float(top[3][1])),
+            )
+            if refined is None:
+                continue
+            meas_dx = refined[0] - float(top[3][0])
+            meas_dy = refined[1] - float(top[3][1])
+            r0, r1 = top[1], bottom[1]
+            rowx.setdefault(r0, []).append(0.0)
+            rowx.setdefault(r1, []).append(meas_dx)
+            rowy.setdefault(r0, []).append(0.0)
+            rowy.setdefault(r1, []).append(meas_dy - dy)
+
+    def cumulative(values: dict[int, list[float]], scale: float = 1.0) -> dict[int, float]:
+        out = {0: 0.0}
+        for idx in sorted(values):
+            if idx == 0:
+                continue
+            prev = idx - 1
+            res = float(np.median(values.get(idx, [0.0]))) * scale
+            out[idx] = out.get(prev, 0.0) + res
+        return out
+
+    col_x = cumulative(colx)
+    col_y = cumulative(coly)
+    row_x = cumulative(rowx)
+    row_y = cumulative(rowy)
+    for t in cells:
+        idx, r, c, pos = t
+        pos[0] = c * dx + col_x.get(c, 0.0) + row_x.get(r, 0.0)
+        pos[1] = r * dy + row_y.get(r, 0.0) + col_y.get(c, 0.0)
+
+
 def stitch_grid_folder(
     paths: Sequence[str | Path],
     *,
@@ -117,6 +191,7 @@ def stitch_grid_folder(
             break
     if not cells:
         raise ValueError("网格没有放置任何照片")
+    _calibrate_grid(cells, images, dx, dy)
 
     # 每一行/列用中点作为接缝：严格垂直线/水平线/L 线，不做距离场曲线。
     x_bounds: dict[int, list[float]] = {}
