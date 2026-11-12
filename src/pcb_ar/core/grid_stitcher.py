@@ -80,78 +80,62 @@ def _refine_pair(
     return previous_pos[0] + dx + shift_x, previous_pos[1] + dy + shift_y
 
 
-def _calibrate_grid(cells, images, dx: float, dy: float) -> None:
-    """用 C 区相位相关求“整行/整列”的偏移量，补偿红色覆盖与实际步长的容差。
+def _calibrate_grid(cells, images, dx: float, dy: float, overlap: float) -> None:
+    """用 C 区实际匹配位移放置相邻图，不用固定 dx/dy 硬算。
 
-    模型：
-      X(r,c) = c*dx + ColX[c] + RowX[r]
-      Y(r,c) = r*dy + RowY[r] + ColY[c]
-    只修正整行/整列，不把每张图自由乱拖。
+    行内测左右位移，列内测上下位移；匹配失败才回退到固定步长。
     """
-    by_row = {}
-    by_col = {}
-    for t in cells:
-        by_row.setdefault(t[1], []).append(t)
-        by_col.setdefault(t[2], []).append(t)
-    # 行内相邻：测列方向偏移
-    colx: dict[int, list[float]] = {}
-    coly: dict[int, list[float]] = {}
-    for r, items in by_row.items():
-        items.sort(key=lambda t: t[3][0])
-        for left, right in zip(items, items[1:]):
-            expected = (float(dx), 0.0)
-            refined = _refine_pair(
-                images[left[0]], images[right[0]], expected,
-                (float(left[3][0]), float(left[3][1])),
-            )
-            if refined is None:
-                continue
-            meas_dx = refined[0] - float(left[3][0])
-            meas_dy = refined[1] - float(left[3][1])
-            c0, c1 = left[2], right[2]
-            colx.setdefault(c0, []).append(0.0)
-            colx.setdefault(c1, []).append(meas_dx - dx)
-            coly.setdefault(c0, []).append(0.0)
-            coly.setdefault(c1, []).append(meas_dy)
-    # 列内相邻：测行方向偏移
-    rowx: dict[int, list[float]] = {}
-    rowy: dict[int, list[float]] = {}
-    for c, items in by_col.items():
-        items.sort(key=lambda t: t[3][1])
-        for top, bottom in zip(items, items[1:]):
-            expected = (0.0, float(dy))
-            refined = _refine_pair(
-                images[top[0]], images[bottom[0]], expected,
-                (float(top[3][0]), float(top[3][1])),
-            )
-            if refined is None:
-                continue
-            meas_dx = refined[0] - float(top[3][0])
-            meas_dy = refined[1] - float(top[3][1])
-            r0, r1 = top[1], bottom[1]
-            rowx.setdefault(r0, []).append(0.0)
-            rowx.setdefault(r1, []).append(meas_dx)
-            rowy.setdefault(r0, []).append(0.0)
-            rowy.setdefault(r1, []).append(meas_dy - dy)
+    from pcb_ar.core.overlap_stitcher import _features, _match_band
 
-    def cumulative(values: dict[int, list[float]], scale: float = 1.0) -> dict[int, float]:
-        out = {0: 0.0}
-        for idx in sorted(values):
-            if idx == 0:
-                continue
-            prev = idx - 1
-            res = float(np.median(values.get(idx, [0.0]))) * scale
-            out[idx] = out.get(prev, 0.0) + res
-        return out
-
-    col_x = cumulative(colx)
-    col_y = cumulative(coly)
-    row_x = cumulative(rowx)
-    row_y = cumulative(rowy)
-    for t in cells:
-        idx, r, c, pos = t
-        pos[0] = c * dx + col_x.get(c, 0.0) + row_x.get(r, 0.0)
-        pos[1] = r * dy + row_y.get(r, 0.0) + col_y.get(c, 0.0)
+    feats = [_features(im) for im in images]
+    h, w = images[0].shape[:2]
+    frac = max(0.10, min(0.45, overlap * 0.5 + 0.02))
+    for _ in range(2):
+        by_row = {}
+        by_col = {}
+        for t in cells:
+            by_row.setdefault(t[1], []).append(t)
+            by_col.setdefault(t[2], []).append(t)
+        for items in by_row.values():
+            items.sort(key=lambda t: t[3][0])
+            for left, right in zip(items, items[1:]):
+                M, inliers = _match_band(
+                    images[left[0]], images[right[0]],
+                    feats[left[0]], feats[right[0]], True, frac,
+                )
+                mx = -M[0, 2] if M is not None else 0.0
+                my = -M[1, 2] if M is not None else 0.0
+                if (
+                    M is not None
+                    and inliers >= 10
+                    and abs(mx - dx) <= max(40.0, 0.3 * abs(dx))
+                    and abs(my) <= 0.2 * h
+                ):
+                    right[3][0] = float(left[3][0] + mx)
+                    right[3][1] = float(left[3][1] + my)
+                else:
+                    right[3][0] = float(left[3][0] + dx)
+                    right[3][1] = float(left[3][1])
+        for items in by_col.values():
+            items.sort(key=lambda t: t[3][1])
+            for top, bottom in zip(items, items[1:]):
+                M, inliers = _match_band(
+                    images[top[0]], images[bottom[0]],
+                    feats[top[0]], feats[bottom[0]], False, frac,
+                )
+                mx = -M[0, 2] if M is not None else 0.0
+                my = -M[1, 2] if M is not None else 0.0
+                if (
+                    M is not None
+                    and inliers >= 10
+                    and abs(my - dy) <= max(40.0, 0.3 * abs(dy))
+                    and abs(mx) <= 0.2 * w
+                ):
+                    bottom[3][0] = float(top[3][0] + mx)
+                    bottom[3][1] = float(top[3][1] + my)
+                else:
+                    bottom[3][0] = float(top[3][0])
+                    bottom[3][1] = float(top[3][1] + dy)
 
 
 def stitch_grid_folder(
@@ -166,7 +150,7 @@ def stitch_grid_folder(
     row_offsets: dict[int, tuple[float, float]] | None = None,
     col_offsets: dict[int, tuple[float, float]] | None = None,
     cell_offsets: dict[tuple[int, int], tuple[float, float]] | None = None,
-    render_mode: str = "top",
+    render_mode: str = "cell",
 ) -> GridStitchResult:
     files = [Path(p) for p in paths]
     images = []
@@ -195,7 +179,7 @@ def stitch_grid_folder(
             break
     if not cells:
         raise ValueError("网格没有放置任何照片")
-    _calibrate_grid(cells, images, dx, dy)
+    _calibrate_grid(cells, images, dx, dy, overlap)
     # 人工容差补偿：整行/整列平移，不破坏网格结构。
     if row_offsets or col_offsets:
         for idx, r, c, pos in cells:
@@ -313,10 +297,12 @@ def stitch_grid_folder(
             flags=cv2.INTER_AREA,
             borderMode=cv2.BORDER_CONSTANT,
         )
-        x0 = max(0, int(round((x0w - min_x) * scale)))
-        x1 = min(width, int(round((x1w - min_x) * scale)))
-        y0 = max(0, int(round((y0w - min_y) * scale)))
-        y1 = min(height, int(round((y1w - min_y) * scale)))
+        # 只向外补 2px，消掉接缝少列；不移动整段接缝。
+        pad = 2
+        x0 = max(0, int(round((x0w - min_x) * scale)) - pad)
+        x1 = min(width, int(round((x1w - min_x) * scale)) + pad)
+        y0 = max(0, int(round((y0w - min_y) * scale)) - pad)
+        y1 = min(height, int(round((y1w - min_y) * scale)) + pad)
         if x1 > x0 and y1 > y0:
             canvas[y0:y1, x0:x1] = warped[y0:y1, x0:x1]
     return GridStitchResult(

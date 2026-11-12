@@ -238,3 +238,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\sync_github.ps1
 
 脚本不会把 token 写入仓库或 git remote；默认创建/同步 `biekuaicom/obsai2026`，并输出仓库地址。
 
+
+## 稳定记录点
+
+- **v0.13.8**：A/B 的“6”文本完美修复，作为回退点。详见 [里程碑](docs/15_里程碑_完美修复6数字文本_v0.13.8.md)。
