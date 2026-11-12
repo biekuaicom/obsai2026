@@ -34,7 +34,17 @@ class _StitchThread(QThread):
     finished_ok = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, files: list[Path], method: str, rows: int, cols: int, overlap: float, serpentine: bool):
+    def __init__(
+        self,
+        files: list[Path],
+        method: str,
+        rows: int,
+        cols: int,
+        overlap: float,
+        serpentine: bool,
+        row_offsets: dict[int, tuple[float, float]],
+        col_offsets: dict[int, tuple[float, float]],
+    ):
         super().__init__()
         self.files = files
         self.method = method
@@ -42,6 +52,8 @@ class _StitchThread(QThread):
         self.cols = cols
         self.overlap = overlap
         self.serpentine = serpentine
+        self.row_offsets = row_offsets
+        self.col_offsets = col_offsets
 
     def run(self) -> None:
         try:
@@ -53,6 +65,8 @@ class _StitchThread(QThread):
                     serpentine=self.serpentine,
                     overlap=self.overlap,
                     max_side=2600,
+                    row_offsets=self.row_offsets,
+                    col_offsets=self.col_offsets,
                 )
             elif self.method == "overlap":
                 result = stitch_overlap_grid(
@@ -78,6 +92,8 @@ class GridStitchDialog(QDialog):
         self.resize(1120, 820)
         self._thread: _StitchThread | None = None
         self._result: GridStitchResult | PhotoStitchResult | None = None
+        self.row_offsets: dict[int, tuple[float, float]] = {}
+        self.col_offsets: dict[int, tuple[float, float]] = {}
         self._build_ui()
         self._update_buttons()
 
@@ -123,6 +139,32 @@ class GridStitchDialog(QDialog):
         options.addWidget(self.serpentine)
         options.addStretch(1)
         root.addLayout(options)
+
+        adjust = QHBoxLayout()
+        adjust.addWidget(QLabel("行微调"))
+        self.adjust_row = QSpinBox()
+        self.adjust_row.setRange(0, 40)
+        adjust.addWidget(self.adjust_row)
+        for text, dx, dy in (("←", -4, 0), ("→", 4, 0), ("↑", 0, -4), ("↓", 0, 4)):
+            b = QPushButton(text)
+            b.setFixedWidth(34)
+            b.clicked.connect(lambda _=False, x=dx, y=dy: self._nudge_row(x, y))
+            adjust.addWidget(b)
+        adjust.addSpacing(12)
+        adjust.addWidget(QLabel("列微调"))
+        self.adjust_col = QSpinBox()
+        self.adjust_col.setRange(0, 40)
+        adjust.addWidget(self.adjust_col)
+        for text, dx, dy in (("←", -4, 0), ("→", 4, 0), ("↑", 0, -4), ("↓", 0, 4)):
+            b = QPushButton(text)
+            b.setFixedWidth(34)
+            b.clicked.connect(lambda _=False, x=dx, y=dy: self._nudge_col(x, y))
+            adjust.addWidget(b)
+        reset = QPushButton("重置微调")
+        reset.clicked.connect(self._reset_offsets)
+        adjust.addWidget(reset)
+        adjust.addStretch(1)
+        root.addLayout(adjust)
 
         self.preview = QLabel("选择照片文件夹后开始拼接")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -171,12 +213,37 @@ class GridStitchDialog(QDialog):
             self.cols.value(),
             float(self.overlap.value()),
             self.serpentine.isChecked(),
+            dict(self.row_offsets),
+            dict(self.col_offsets),
         )
         self._thread.finished_ok.connect(self._on_ok)
         self._thread.failed.connect(self._on_failed)
         self._thread.start()
         self.status.setText("拼接中… 大图可能需要几十秒")
         self._update_buttons()
+
+    def _nudge_row(self, dx: float, dy: float) -> None:
+        row = self.adjust_row.value()
+        ox, oy = self.row_offsets.get(row, (0.0, 0.0))
+        self.row_offsets[row] = (ox + dx, oy + dy)
+        self.status.setText(f"第 {row + 1} 行偏移：({ox + dx:.0f}, {oy + dy:.0f})")
+        if self._files and self.method.currentData() == "grid":
+            self.start()
+
+    def _nudge_col(self, dx: float, dy: float) -> None:
+        col = self.adjust_col.value()
+        ox, oy = self.col_offsets.get(col, (0.0, 0.0))
+        self.col_offsets[col] = (ox + dx, oy + dy)
+        self.status.setText(f"第 {col + 1} 列偏移：({ox + dx:.0f}, {oy + dy:.0f})")
+        if self._files and self.method.currentData() == "grid":
+            self.start()
+
+    def _reset_offsets(self) -> None:
+        self.row_offsets.clear()
+        self.col_offsets.clear()
+        self.status.setText("已重置行/列微调")
+        if self._files and self.method.currentData() == "grid":
+            self.start()
 
     def _on_ok(self, result) -> None:
         self._result = result

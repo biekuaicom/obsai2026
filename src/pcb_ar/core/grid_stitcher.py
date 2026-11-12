@@ -163,6 +163,8 @@ def stitch_grid_folder(
     overlap: float = 0.3,
     step: tuple[float, float] | None = None,
     max_side: int = 3200,
+    row_offsets: dict[int, tuple[float, float]] | None = None,
+    col_offsets: dict[int, tuple[float, float]] | None = None,
 ) -> GridStitchResult:
     files = [Path(p) for p in paths]
     images = []
@@ -192,6 +194,15 @@ def stitch_grid_folder(
     if not cells:
         raise ValueError("网格没有放置任何照片")
     _calibrate_grid(cells, images, dx, dy)
+    # 人工容差补偿：整行/整列平移，不破坏网格结构。
+    if row_offsets or col_offsets:
+        for idx, r, c, pos in cells:
+            if row_offsets and r in row_offsets:
+                pos[0] += float(row_offsets[r][0])
+                pos[1] += float(row_offsets[r][1])
+            if col_offsets and c in col_offsets:
+                pos[0] += float(col_offsets[c][0])
+                pos[1] += float(col_offsets[c][1])
 
     # 每一行/列用中点作为接缝：严格垂直线/水平线/L 线，不做距离场曲线。
     x_bounds: dict[int, list[float]] = {}
