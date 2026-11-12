@@ -54,7 +54,7 @@ if (Test-Path (Join-Path $Root "docs")) {
     Copy-Item (Join-Path $Root "docs") (Join-Path $Dist "docs") -Recurse -Force
 }
 $Quick = @"
-PCB AR 显微标注核对系统 v0.13.3
+PCB AR 显微标注核对系统 v0.13.4
 ================================
 双击 PCB_AR_Annotator.exe 启动。
 
@@ -77,7 +77,7 @@ PCB AR 显微标注核对系统 v0.13.3
 Set-Content -Path (Join-Path $Dist "使用说明.txt") -Value $Quick -Encoding UTF8
 
 if (-not $SkipZip) {
-    $Zip = Join-Path $Root ("dist\PCB_AR_Annotator_v0.13.3_win64.zip")
+    $Zip = Join-Path $Root ("dist\PCB_AR_Annotator_v0.13.4_win64.zip")
     if (Test-Path $Zip) { Remove-Item $Zip -Force }
     & $Python (Join-Path $Root "scripts\package_zip.py") $Dist $Zip
     if ($LASTEXITCODE -ne 0) { throw "压缩发布包失败" }
@@ -85,7 +85,7 @@ if (-not $SkipZip) {
     $hash = Get-FileHash $Exe -Algorithm SHA256
     $zipHash = Get-FileHash $Zip -Algorithm SHA256
     @(
-        "PCB AR Annotator v0.13.3",
+        "PCB AR Annotator v0.13.4",
         "exe: $($hash.Hash)",
         "zip: $($zipHash.Hash)"
     ) | Set-Content -Path (Join-Path $Root "dist\CHECKSUMS.txt") -Encoding UTF8

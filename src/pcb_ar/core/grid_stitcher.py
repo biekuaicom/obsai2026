@@ -166,6 +166,7 @@ def stitch_grid_folder(
     row_offsets: dict[int, tuple[float, float]] | None = None,
     col_offsets: dict[int, tuple[float, float]] | None = None,
     cell_offsets: dict[tuple[int, int], tuple[float, float]] | None = None,
+    render_mode: str = "top",
 ) -> GridStitchResult:
     files = [Path(p) for p in paths]
     images = []
@@ -210,6 +211,43 @@ def stitch_grid_folder(
                 oy = max(-10.0, min(10.0, float(cell_offsets[(r, c)][1])))
                 pos[0] += ox
                 pos[1] += oy
+
+    if render_mode == "top":
+        # 层级合成：后放的照片在上层，整张照片参与，不按 cell 裁掉。
+        # 这样 B 图里完整圆不会被接缝多切掉；接缝落在照片矩形边缘（直线）。
+        min_x = min(float(t[3][0]) for t in cells)
+        min_y = min(float(t[3][1]) for t in cells)
+        max_x = max(float(t[3][0]) + w for t in cells)
+        max_y = max(float(t[3][1]) + h for t in cells)
+        scale = min(1.0, max_side / float(max(max_x - min_x, max_y - min_y)))
+        width = max(1, int(round((max_x - min_x) * scale)))
+        height = max(1, int(round((max_y - min_y) * scale)))
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        for idx, r, c, pos in cells:
+            matrix = np.array(
+                [[scale, 0, (pos[0] - min_x) * scale], [0, scale, (pos[1] - min_y) * scale], [0, 0, 1]],
+                dtype=np.float64,
+            )
+            warped = cv2.warpAffine(
+                images[idx], matrix[:2].astype(np.float32), (width, height),
+                flags=cv2.INTER_AREA, borderMode=cv2.BORDER_CONSTANT,
+            )
+            # 只修剪物理外边缘 2px（坏边），不切重叠区内部。
+            footprint = np.zeros(image.shape[:2], dtype=np.uint8)
+            b = 2
+            footprint[b : image.shape[0] - b, b : image.shape[1] - b] = 255
+            fmask = cv2.warpAffine(
+                footprint, matrix[:2].astype(np.float32), (width, height),
+                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            ) > 0
+            canvas[fmask] = warped[fmask]
+        return GridStitchResult(
+            image=canvas,
+            placed=len(cells),
+            total=len(images),
+            step=(dx, dy),
+            message=f"{len(cells)}/{len(images)} 张 / 步长 {dx:.1f},{dy:.1f} / 上层覆盖",
+        )
 
     # 每一行/列用中点作为接缝：严格垂直线/水平线/L 线，不做距离场曲线。
     x_bounds: dict[int, list[float]] = {}
