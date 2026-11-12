@@ -102,7 +102,7 @@ def stitch_grid_folder(
     if step is None:
         step = (w * (1.0 - overlap), h * (1.0 - overlap))
     dx, dy = float(step[0]), float(step[1])
-    positions: list[np.ndarray] = []
+    cells: list[tuple[int, int, int, np.ndarray]] = []
     index = 0
     for r in range(rows):
         order = range(cols)
@@ -111,37 +111,63 @@ def stitch_grid_folder(
         for c in order:
             if index >= len(images):
                 break
-            x = c * dx
-            y = r * dy
-            # 左侧/上方已放置邻居做局部相位相关，不做全局优化。
-            if c > 0:
-                prev_idx = index - 1
-                if 0 <= prev_idx < len(positions):
-                    refined = _refine_pair(
-                        images[prev_idx],
-                        images[index],
-                        (dx, dy),
-                        (float(positions[prev_idx][0]), float(positions[prev_idx][1])),
-                    )
-                    if refined is not None:
-                        x, y = refined
-            positions.append(np.array([x, y], dtype=np.float64))
+            cells.append((index, r, c, np.array([c * dx, r * dy], dtype=np.float64)))
             index += 1
         if index >= len(images):
             break
-    if not positions:
+    if not cells:
         raise ValueError("网格没有放置任何照片")
 
-    min_x = min(p[0] for p in positions)
-    min_y = min(p[1] for p in positions)
-    max_x = max(p[0] for p in positions) + w
-    max_y = max(p[1] for p in positions) + h
+    # 每一行/列用中点作为接缝：严格垂直线/水平线/L 线，不做距离场曲线。
+    x_bounds: dict[int, list[float]] = {}
+    row_y: dict[int, float] = {}
+    for r in range(rows):
+        row_cells = sorted([x for x in cells if x[1] == r], key=lambda t: t[3][0])
+        if not row_cells:
+            continue
+        xs = [float(t[3][0]) for t in row_cells]
+        # 外侧接缝在首/末照片边缘；内部接缝在重叠区中点（不是图心中点）。
+        bounds = [xs[0]]
+        for a, b in zip(xs, xs[1:]):
+            if b < a + w:
+                bounds.append((b + a + w) / 2.0)
+            else:
+                bounds.append((a + b) / 2.0)
+        bounds.append(xs[-1] + w)
+        x_bounds[r] = bounds
+        row_y[r] = float(np.mean([t[3][1] for t in row_cells]))
+    row_ids = sorted(row_y)
+    y_bounds: list[float] = []
+    if row_ids:
+        y_bounds = [row_y[row_ids[0]]]
+        for a, b in zip(row_ids, row_ids[1:]):
+            ya, yb = row_y[a], row_y[b]
+            if yb < ya + h:
+                y_bounds.append((yb + ya + h) / 2.0)
+            else:
+                y_bounds.append((ya + yb) / 2.0)
+        y_bounds.append(row_y[row_ids[-1]] + h)
+
+    min_x = min(x_bounds[r][0] for r in x_bounds)
+    max_x = max(x_bounds[r][-1] for r in x_bounds)
+    min_y = y_bounds[0]
+    max_y = y_bounds[-1]
     scale = min(1.0, max_side / float(max(max_x - min_x, max_y - min_y)))
     width = max(1, int(round((max_x - min_x) * scale)))
     height = max(1, int(round((max_y - min_y) * scale)))
     canvas = np.zeros((height, width, 3), dtype=np.uint8)
-    best = np.zeros((height, width), dtype=np.float32)
-    for image, pos in zip(images, positions):
+    for idx, r, c, pos in cells:
+        image = images[idx]
+        row_cells = sorted([t for t in cells if t[1] == r], key=lambda t: t[3][0])
+        ci = next((k for k, t in enumerate(row_cells) if t[0] == idx), None)
+        if ci is None:
+            continue
+        x0w = x_bounds[r][ci]
+        x1w = x_bounds[r][ci + 1]
+        ri = row_ids.index(r)
+        y0w = y_bounds[ri]
+        y1w = y_bounds[ri + 1]
+        # warp 整图，只拷贝本 cell，cell 外不参与。
         matrix = np.array(
             [
                 [scale, 0.0, (pos[0] - min_x) * scale],
@@ -157,27 +183,16 @@ def stitch_grid_folder(
             flags=cv2.INTER_AREA,
             borderMode=cv2.BORDER_CONSTANT,
         )
-        mask = cv2.warpAffine(
-            foreground_mask(image),
-            matrix[:2].astype(np.float32),
-            (width, height),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-        ) > 0
-        if not np.any(mask):
-            continue
-        x, y, ww, hh = cv2.boundingRect(mask.astype(np.uint8))
-        dist = np.zeros((height, width), dtype=np.float32)
-        dist[y : y + hh, x : x + ww] = cv2.distanceTransform(
-            mask[y : y + hh, x : x + ww].astype(np.uint8), cv2.DIST_L2, 5
-        )
-        better = mask & (dist > best + 0.3)
-        canvas[better] = warped[better]
-        best = np.maximum(best, dist)
+        x0 = max(0, int(round((x0w - min_x) * scale)))
+        x1 = min(width, int(round((x1w - min_x) * scale)))
+        y0 = max(0, int(round((y0w - min_y) * scale)))
+        y1 = min(height, int(round((y1w - min_y) * scale)))
+        if x1 > x0 and y1 > y0:
+            canvas[y0:y1, x0:x1] = warped[y0:y1, x0:x1]
     return GridStitchResult(
         image=canvas,
-        placed=min(index, len(images)),
+        placed=len(cells),
         total=len(images),
         step=(dx, dy),
-        message=f"{min(index, len(images))}/{len(images)} 张 / 步长 {dx:.1f},{dy:.1f}",
+        message=f"{len(cells)}/{len(images)} 张 / 步长 {dx:.1f},{dy:.1f} / 直线接缝",
     )

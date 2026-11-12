@@ -15,7 +15,8 @@ def foreground_mask(image: np.ndarray) -> np.ndarray:
     if image is None or image.size == 0:
         return np.zeros((0, 0), dtype=np.uint8)
     h, w = image.shape[:2]
-    fallback = (np.max(image, axis=2) > 7).astype(np.uint8) * 255
+    # 不确定时整张图都算板面；宁可保留纸边，也不能切掉板内白色区域。
+    fallback = np.full((h, w), 255, dtype=np.uint8)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     s = hsv[:, :, 1]
     v = hsv[:, :, 2]
@@ -34,14 +35,13 @@ def foreground_mask(image: np.ndarray) -> np.ndarray:
         mask = (labels == largest).astype(np.uint8) * 255
     except cv2.error:
         return fallback
-    # 填掉板内的丝印/孔洞，保留外轮廓。
+    # 只保留板的外轮廓；外轮廓内部全部有效。
+    # 白色丝印、白色连接器、金属亮面都属于板内，不能按颜色删除。
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return fallback
     filled = np.zeros((h, w), dtype=np.uint8)
     cv2.drawContours(filled, contours, -1, 255, thickness=cv2.FILLED)
-    # 轻微内缩，避免把板边缘外的白边带进来。
-    filled = cv2.erode(filled, np.ones((3, 3), np.uint8), iterations=1)
     if int(np.count_nonzero(filled)) < int(0.03 * h * w):
         return fallback
     return filled
