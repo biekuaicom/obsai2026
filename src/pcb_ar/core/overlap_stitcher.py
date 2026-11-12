@@ -44,6 +44,54 @@ def _features(image: np.ndarray):
     return pts, des, kp
 
 
+def _similarity_from_three(src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
+    """三个非共线点求相似变换（Umeyama 最小二乘）。"""
+    if len(src) != 3 or len(dst) != 3:
+        return None
+    src = np.asarray(src, np.float64)
+    dst = np.asarray(dst, np.float64)
+    # 非共线校验
+    area = abs(np.cross(src[1] - src[0], src[2] - src[0]))
+    if area < 16.0:
+        return None
+    mu_s = src.mean(0)
+    mu_d = dst.mean(0)
+    s = src - mu_s
+    d = dst - mu_d
+    cov = (d.T @ s) / 3.0
+    u, sigma, vt = np.linalg.svd(cov)
+    r = u @ vt
+    if np.linalg.det(r) < 0:
+        u[:, -1] *= -1
+        r = u @ vt
+    var = float(np.mean(np.sum(s * s, axis=1)))
+    if var < 1e-6:
+        return None
+    scale = float(np.sum(sigma) / var)
+    t = mu_d - scale * (r @ mu_s)
+    m = np.eye(3)
+    m[:2, :2] = scale * r
+    m[:2, 2] = t
+    return m
+
+
+def _best_anchor_triplet(points: np.ndarray) -> np.ndarray | None:
+    """在匹配点里选面积最大的三个非共线点。"""
+    if len(points) < 3:
+        return None
+    pts = points[: min(len(points), 40)]
+    best = None
+    best_area = 0.0
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            for k in range(j + 1, len(pts)):
+                a = abs(float(np.cross(pts[j] - pts[i], pts[k] - pts[i])))
+                if a > best_area:
+                    best_area = a
+                    best = np.array([i, j, k])
+    return best
+
+
 def _match_band(
     a: np.ndarray,
     b: np.ndarray,
@@ -87,6 +135,18 @@ def _match_band(
     if inliers < 10:
         return None, inliers
     hmat = np.vstack([matrix, [0.0, 0.0, 1.0]]).astype(np.float64)
+    # 三点锚点优先：选面积最大、非共线的三个 RANSAC 内点。
+    idx = np.where(mask.ravel() > 0)[0]
+    if len(idx) >= 3:
+        triplet = _best_anchor_triplet(src[idx])
+        if triplet is not None:
+            a_idx = idx[triplet]
+            m3 = _similarity_from_three(src[a_idx], dst[a_idx])
+            if m3 is not None:
+                pred = cv2.transform(src.reshape(-1, 1, 2), m3[:2]).reshape(-1, 2)
+                err = np.linalg.norm(pred - dst, axis=1)[idx]
+                if float(np.median(err)) < 3.0 and float(np.percentile(err, 90)) < 6.0:
+                    return m3, inliers
     return hmat, inliers
 
 
