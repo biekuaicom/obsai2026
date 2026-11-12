@@ -2,7 +2,7 @@
 
 面向“摄像头固定在 PCB 正上方、显微镜手动平移/旋转”的桌面工具。默认流程已从“生成完整大拼图”改为 **轻量引导捕获 + 稀疏关键帧地图 + 全图周期校验**：只保存关键帧、ORB/边缘特征、位姿和覆盖区域；全图能力作为可选增强与备用。
 
-> 版本：0.13.2（默认轻量建图；尚未经过真实 800 万像素显微硬件验收）
+> 版本：0.13.3（默认轻量建图；尚未经过真实 800 万像素显微硬件验收）
 >
 > 运行环境：Windows 10/11 x64 · Python 3.12（源码）· 便携版无需安装 Python
 >
@@ -52,13 +52,13 @@
 
 ### 方式 A：打包版（推荐给现场）
 
-1. 解压 `dist/PCB_AR_Annotator_v0.13.2_win64.zip`。
+1. 解压 `dist/PCB_AR_Annotator_v0.13.3_win64.zip`。
 2. 双击 `PCB_AR_Annotator.exe`。
 3. 首次启动自动生成演示工程；移动/旋转时标注应吸附在元件上。
 4. 点击「轻量扫描建图…」体验新的默认流程；需要整图时用「输入 → 全图扫描（备用/增强）」。
 5. 详见 [使用指南](docs/03_使用指南.md)。
 
-> Windows SmartScreen 可能提示未知发布者（未签名）。选择“更多信息 → 仍要运行”。正式交付建议做代码签名。v0.13.2 本机包：onedir 约 218 MB，zip 约 86 MB。
+> Windows SmartScreen 可能提示未知发布者（未签名）。选择“更多信息 → 仍要运行”。正式交付建议做代码签名。v0.13.3 本机包：onedir 约 218 MB，zip 约 86 MB。
 
 ### 方式 B：源码
 
@@ -200,7 +200,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
 产物：
 
 - `dist/PCB_AR_Annotator/PCB_AR_Annotator.exe`
-- `dist/PCB_AR_Annotator_v0.13.2_win64.zip`
+- `dist/PCB_AR_Annotator_v0.13.3_win64.zip`
 - `artifacts/packaged_selftest.json`、`artifacts/packaged_demo.png`
 - `dist/CHECKSUMS.txt`
 

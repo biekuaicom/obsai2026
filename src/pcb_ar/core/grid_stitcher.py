@@ -165,6 +165,7 @@ def stitch_grid_folder(
     max_side: int = 3200,
     row_offsets: dict[int, tuple[float, float]] | None = None,
     col_offsets: dict[int, tuple[float, float]] | None = None,
+    cell_offsets: dict[tuple[int, int], tuple[float, float]] | None = None,
 ) -> GridStitchResult:
     files = [Path(p) for p in paths]
     images = []
@@ -203,6 +204,12 @@ def stitch_grid_folder(
             if col_offsets and c in col_offsets:
                 pos[0] += float(col_offsets[c][0])
                 pos[1] += float(col_offsets[c][1])
+            if cell_offsets and (r, c) in cell_offsets:
+                # 单图局部微调只允许 ±10px，不能重排整格。
+                ox = max(-10.0, min(10.0, float(cell_offsets[(r, c)][0])))
+                oy = max(-10.0, min(10.0, float(cell_offsets[(r, c)][1])))
+                pos[0] += ox
+                pos[1] += oy
 
     # 每一行/列用中点作为接缝：严格垂直线/水平线/L 线，不做距离场曲线。
     x_bounds: dict[int, list[float]] = {}

@@ -44,6 +44,7 @@ class _StitchThread(QThread):
         serpentine: bool,
         row_offsets: dict[int, tuple[float, float]],
         col_offsets: dict[int, tuple[float, float]],
+        cell_offsets: dict[tuple[int, int], tuple[float, float]],
     ):
         super().__init__()
         self.files = files
@@ -54,6 +55,7 @@ class _StitchThread(QThread):
         self.serpentine = serpentine
         self.row_offsets = row_offsets
         self.col_offsets = col_offsets
+        self.cell_offsets = cell_offsets
 
     def run(self) -> None:
         try:
@@ -67,6 +69,7 @@ class _StitchThread(QThread):
                     max_side=2600,
                     row_offsets=self.row_offsets,
                     col_offsets=self.col_offsets,
+                    cell_offsets=self.cell_offsets,
                 )
             elif self.method == "overlap":
                 result = stitch_overlap_grid(
@@ -94,6 +97,7 @@ class GridStitchDialog(QDialog):
         self._result: GridStitchResult | PhotoStitchResult | None = None
         self.row_offsets: dict[int, tuple[float, float]] = {}
         self.col_offsets: dict[int, tuple[float, float]] = {}
+        self.cell_offsets: dict[tuple[int, int], tuple[float, float]] = {}
         self._build_ui()
         self._update_buttons()
 
@@ -160,6 +164,13 @@ class GridStitchDialog(QDialog):
             b.setFixedWidth(34)
             b.clicked.connect(lambda _=False, x=dx, y=dy: self._nudge_col(x, y))
             adjust.addWidget(b)
+        adjust.addSpacing(12)
+        adjust.addWidget(QLabel("单图微调"))
+        for text, dx, dy in (("←", -2, 0), ("→", 2, 0), ("↑", 0, -2), ("↓", 0, 2)):
+            b = QPushButton(text)
+            b.setFixedWidth(34)
+            b.clicked.connect(lambda _=False, x=dx, y=dy: self._nudge_cell(x, y))
+            adjust.addWidget(b)
         reset = QPushButton("重置微调")
         reset.clicked.connect(self._reset_offsets)
         adjust.addWidget(reset)
@@ -215,6 +226,7 @@ class GridStitchDialog(QDialog):
             self.serpentine.isChecked(),
             dict(self.row_offsets),
             dict(self.col_offsets),
+            dict(self.cell_offsets),
         )
         self._thread.finished_ok.connect(self._on_ok)
         self._thread.failed.connect(self._on_failed)
@@ -238,10 +250,21 @@ class GridStitchDialog(QDialog):
         if self._files and self.method.currentData() == "grid":
             self.start()
 
+    def _nudge_cell(self, dx: float, dy: float) -> None:
+        key = (self.adjust_row.value(), self.adjust_col.value())
+        ox, oy = self.cell_offsets.get(key, (0.0, 0.0))
+        nx = max(-10.0, min(10.0, ox + dx))
+        ny = max(-10.0, min(10.0, oy + dy))
+        self.cell_offsets[key] = (nx, ny)
+        self.status.setText(f"单图 r{key[0] + 1} c{key[1] + 1} 偏移：({nx:.0f}, {ny:.0f})")
+        if self._files and self.method.currentData() == "grid":
+            self.start()
+
     def _reset_offsets(self) -> None:
         self.row_offsets.clear()
         self.col_offsets.clear()
-        self.status.setText("已重置行/列微调")
+        self.cell_offsets.clear()
+        self.status.setText("已重置行/列/单图微调")
         if self._files and self.method.currentData() == "grid":
             self.start()
 
