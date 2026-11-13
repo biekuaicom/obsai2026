@@ -1,6 +1,7 @@
 """离线照片文件夹 → 网格/自动拼接工作台。"""
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Callable
@@ -138,8 +139,9 @@ class GridStitchDialog(QDialog):
         self.overlap.setValue(0.33)
         self.overlap.setDecimals(2)
         options.addWidget(self.overlap)
-        self.serpentine = QCheckBox("蛇形顺序")
-        self.serpentine.setChecked(True)
+        self.serpentine = QCheckBox("蛇形顺序（第二行反向）")
+        self.serpentine.setChecked(False)
+        self.serpentine.setToolTip("每行都左→右拍照时不要勾选；只有实际蛇形往返时才勾选。")
         options.addWidget(self.serpentine)
         options.addStretch(1)
         root.addLayout(options)
@@ -206,7 +208,8 @@ class GridStitchDialog(QDialog):
         if not path:
             return
         files = sorted(
-            p for p in Path(path).iterdir() if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png")
+            (p for p in Path(path).iterdir() if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png")),
+            key=lambda p: [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", p.name)],
         )
         self._files = files
         self.path_label.setText(f"照片文件夹：{path}（{len(files)} 张）")

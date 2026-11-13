@@ -143,7 +143,7 @@ def stitch_grid_folder(
     *,
     rows: int,
     cols: int,
-    serpentine: bool = True,
+    serpentine: bool = False,
     overlap: float = 0.3,
     step: tuple[float, float] | None = None,
     max_side: int = 3200,
