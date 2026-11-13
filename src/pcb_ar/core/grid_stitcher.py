@@ -81,61 +81,79 @@ def _refine_pair(
 
 
 def _calibrate_grid(cells, images, dx: float, dy: float, overlap: float) -> None:
-    """用 C 区实际匹配位移放置相邻图，不用固定 dx/dy 硬算。
-
-    行内测左右位移，列内测上下位移；匹配失败才回退到固定步长。
-    """
-    from pcb_ar.core.overlap_stitcher import _features, _match_band
-
-    feats = [_features(im) for im in images]
+    """冻结拼图 + 实际交集 + 单次相似变换。"""
+    if not cells:
+        return
     h, w = images[0].shape[:2]
-    frac = max(0.10, min(0.45, overlap * 0.5 + 0.02))
-    for _ in range(2):
-        by_row = {}
-        by_col = {}
-        for t in cells:
-            by_row.setdefault(t[1], []).append(t)
-            by_col.setdefault(t[2], []).append(t)
-        for items in by_row.values():
-            items.sort(key=lambda t: t[3][0])
-            for left, right in zip(items, items[1:]):
-                M, inliers = _match_band(
-                    images[left[0]], images[right[0]],
-                    feats[left[0]], feats[right[0]], True, frac,
-                )
-                mx = -M[0, 2] if M is not None else 0.0
-                my = -M[1, 2] if M is not None else 0.0
-                if (
-                    M is not None
-                    and inliers >= 10
-                    and abs(mx - dx) <= max(40.0, 0.3 * abs(dx))
-                    and abs(my) <= 0.2 * h
-                ):
-                    right[3][0] = float(left[3][0] + mx)
-                    right[3][1] = float(left[3][1] + my)
-                else:
-                    right[3][0] = float(left[3][0] + dx)
-                    right[3][1] = float(left[3][1])
-        for items in by_col.values():
-            items.sort(key=lambda t: t[3][1])
-            for top, bottom in zip(items, items[1:]):
-                M, inliers = _match_band(
-                    images[top[0]], images[bottom[0]],
-                    feats[top[0]], feats[bottom[0]], False, frac,
-                )
-                mx = -M[0, 2] if M is not None else 0.0
-                my = -M[1, 2] if M is not None else 0.0
-                if (
-                    M is not None
-                    and inliers >= 10
-                    and abs(my - dy) <= max(40.0, 0.3 * abs(dy))
-                    and abs(mx) <= 0.2 * w
-                ):
-                    bottom[3][0] = float(top[3][0] + mx)
-                    bottom[3][1] = float(top[3][1] + my)
-                else:
-                    bottom[3][0] = float(top[3][0])
-                    bottom[3][1] = float(top[3][1] + dy)
+    W = int((len(images) + 2) * w)
+    H = int((len(images) + 2) * h)
+    frozen = np.zeros((H, W, 3), np.uint8)
+    cover = np.zeros((H, W), np.uint8)
+    first = cells[0]
+    first[3][0] = float(w)
+    first[3][1] = float(h)
+    frozen[h:h+h, w:w+w] = images[0]
+    cover[h:h+h, w:w+w] = 255
+
+    for t in cells[1:]:
+        r, c = t[1], t[2]
+        rough_x = float(w + c * dx)
+        rough_y = float(h + r * dy)
+        x0 = max(0, int(rough_x))
+        y0 = max(0, int(rough_y))
+        x1 = min(W, int(rough_x) + w)
+        y1 = min(H, int(rough_y) + h)
+        if x1 - x0 < 50 or y1 - y0 < 50:
+            t[3][0], t[3][1] = rough_x, rough_y
+            continue
+        cm = cover[y0:y1, x0:x1]
+        if int(np.count_nonzero(cm)) < 500:
+            t[3][0], t[3][1] = rough_x, rough_y
+            continue
+        frozen_crop = frozen[y0:y1, x0:x1].copy()
+        frozen_crop[cm == 0] = 0
+        new_crop = images[t[0]][0:y1-y0, 0:x1-x0]
+        ga = cv2.cvtColor(frozen_crop, cv2.COLOR_BGR2GRAY)
+        gb = cv2.cvtColor(new_crop, cv2.COLOR_BGR2GRAY)
+        orb = cv2.ORB_create(nfeatures=2500)
+        ka, da = orb.detectAndCompute(ga, None)
+        kb, db = orb.detectAndCompute(gb, None)
+        if da is None or db is None or len(ka) < 10 or len(kb) < 10:
+            t[3][0], t[3][1] = rough_x, rough_y
+            continue
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        try:
+            knn = bf.knnMatch(da, db, k=2)
+        except cv2.error:
+            t[3][0], t[3][1] = rough_x, rough_y
+            continue
+        good = [pair[0] for pair in knn if len(pair) == 2 and pair[0].distance < 0.72 * pair[1].distance]
+        if len(good) < 10:
+            t[3][0], t[3][1] = rough_x, rough_y
+            continue
+        pa = np.float32([ka[m.queryIdx].pt for m in good])
+        pb = np.float32([kb[m.trainIdx].pt for m in good])
+        M, mask = cv2.estimateAffinePartial2D(pa, pb, method=cv2.RANSAC, ransacReprojThreshold=4.0, maxIters=3000)
+        if M is None or mask is None or int(np.count_nonzero(mask)) < 10:
+            t[3][0], t[3][1] = rough_x, rough_y
+            continue
+        # M: frozen crop -> new crop. 新图原点 = C 起点 - M 平移。
+        px = x0 - float(M[0, 2])
+        py = y0 - float(M[1, 2])
+        if abs(px - rough_x) > max(60.0, 0.6 * w) or abs(py - rough_y) > max(60.0, 0.6 * h):
+            t[3][0], t[3][1] = rough_x, rough_y
+        else:
+            t[3][0], t[3][1] = px, py
+        xx = int(round(t[3][0])); yy = int(round(t[3][1]))
+        if 0 <= xx < W - w and 0 <= yy < H - h:
+            frozen[yy:yy+h, xx:xx+w] = images[t[0]]
+            cover[yy:yy+h, xx:xx+w] = 255
+
+    min_x = min(float(t[3][0]) for t in cells)
+    min_y = min(float(t[3][1]) for t in cells)
+    for t in cells:
+        t[3][0] -= min_x
+        t[3][1] -= min_y
 
 
 def stitch_grid_folder(
