@@ -170,9 +170,17 @@ def _fit_similarity(src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
 
 
 def _shift_limit(width: int, height: int) -> float:
-    # 只允许相似变换在当前候选足迹上做小修正。大的步长误差交给候选，
-    # 不能靠把新图滑进旧图来凑重叠面积。
+    # 形状星座已经锁定时，只允许在当前候选足迹上做小修正。
     return max(40.0, 0.14 * float(min(width, height)))
+
+
+def _verified_shift_limit(width: int, height: int) -> float:
+    """内容核对已经通过时，允许重叠带候选上的步长修正。
+
+    20px 左右的残差必须留下。默认 overlap=0.3 的 448px 猜测到真实
+    约 554px，也还有大约 100px，不能在核对通过后再丢掉。
+    """
+    return max(130.0, 0.25 * float(min(width, height)))
 
 
 def _center_shift(pose: np.ndarray, rough: np.ndarray, width: int, height: int) -> float:
@@ -818,6 +826,9 @@ def _verify_content(
     edges = _edge_iou(_gray(frozen_roi), _gray(warped), refined)
     if anchor_hits >= 2 and residual <= 2.6 and ncc >= 0.45:
         return True
+    # 窄 C 里孔/元件可能抽不准。残差已经很小、相关过得去时，ORB 位姿可以过。
+    if residual <= 2.2 and ncc >= 0.50:
+        return True
     if ncc >= 0.55 and residual <= 3.6:
         return True
     if ncc >= 0.72:
@@ -1071,18 +1082,17 @@ def _align_tile(
             dst_pts = dst_pts / analysis
             matrix = matrix.copy()
             matrix[:, 2] = matrix[:, 2] / analysis
-        if not _anchors_agree(src_shapes, dst_shapes, matrix):
-            return None
+        # 锚点对不齐不能单独否决。窄重叠里孔/元件经常缺或有噪声；
+        # 周期焊盘不进入星座求解，ORB 位姿仍必须通过同一块 C 的内容核对。
+        anchors_ok = _anchors_agree(src_shapes, dst_shapes, matrix)
         keep = min(40, len(src_pts))
         point_pairs = [(src_pts[i], dst_pts[i]) for i in range(keep)]
-        anchor_hits = 2 if _anchors_agree(src_shapes, dst_shapes, matrix) and src_shapes else 0
+        anchor_hits = 2 if anchors_ok and src_shapes else 0
     pose = _pose_from_roi_pairs(point_pairs, inv_local, origin)
     if pose is None:
         return None
     pose = _tighten_vertical(frozen_roi, image, pose, origin, cmask, point_pairs, inv_local)
     height, width = image.shape[:2]
-    if _center_shift(pose, rough, width, height) > _shift_limit(width, height):
-        return None
     # 形状星座已经锁定时不再做 ECC，避免周期焊盘把位姿吸走。
     # 只有 ORB 二次测量才允许在同一 C 内做一次小幅 ECC。
     if not shape_locked:
@@ -1109,6 +1119,11 @@ def _align_tile(
         anchor_hits=anchor_hits,
         sizes_ok=sizes_ok,
     ):
+        return None
+    # 核对通过之后才看位移。重叠带上大约 20px 的残差要留下；
+    # 从 overlap 猜测修到真实步长（约 100px）也不能在这里丢掉。
+    limit = _shift_limit(width, height) if shape_locked else _verified_shift_limit(width, height)
+    if _center_shift(pose, rough, width, height) > limit:
         return None
     return pose
 

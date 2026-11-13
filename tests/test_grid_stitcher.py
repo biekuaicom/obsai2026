@@ -385,3 +385,38 @@ def test_match_region_is_intersection_not_full_rectangle():
     assert np.all(frozen_roi[~mask] == 0)
     # 交集大约是 x=40..70，而不是整幅 120 宽的预测矩形。
     assert int(np.count_nonzero(mask)) < 50 * height
+
+
+def test_verified_orb_pose_survives_anchor_disagreement(tmp_path, monkeypatch):
+    """星座失败时，同一块 C 里核对通过的 ORB 位姿不能被锚点否决丢掉。"""
+    import pcb_ar.core.grid_stitcher as gs
+
+    monkeypatch.setattr(gs, "_match_constellation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gs, "_anchors_agree", lambda *_args, **_kwargs: False)
+    size = (360, 260)
+    origin_a = (24.0, 30.0)
+    origin_b = (184.0, 30.0)
+    angle = 1.2
+    scene = _paint_board()
+    tiles = [
+        _cut_tile(scene, origin_a, size, 0.0),
+        _cut_tile(scene, origin_b, size, angle),
+    ]
+    result = stitch_grid_folder(
+        _write_tiles(tmp_path, tiles),
+        rows=1,
+        cols=2,
+        serpentine=False,
+        step=(160.0, 220.0),
+        max_side=4000,
+    )
+    assert result.placed == 2, result.message
+    assert result.poses is not None and result.poses[1] is not None
+    expected = _compose(
+        invert_affine(_tile_to_scene(origin_a, size, 0.0)).astype(np.float64),
+        _tile_to_scene(origin_b, size, angle),
+    )
+    error = _max_point_error(_relative(result.poses[0], result.poses[1]), expected, size[0], size[1])
+    assert error < 8.0, error
+    # 约 20px 的核对后残差必须留在允许范围内；从 448 修到约 554 的量级也要留得下。
+    assert gs._verified_shift_limit(640, 480) >= 108.0
