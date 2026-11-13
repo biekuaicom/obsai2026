@@ -294,8 +294,11 @@ def _traces(gray: np.ndarray, mask: np.ndarray) -> list[_Shape]:
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold=28, minLineLength=min_len, maxLineGap=8)
     if lines is None:
         return []
+    # OpenCV 4.12 有的构建返回 (N, 4)，有的仍是 (N, 1, 4)。
+    packed = np.asarray(lines)
+    raws = packed[:, 0, :] if packed.ndim == 3 else packed.reshape(-1, 4)
     shapes: list[_Shape] = []
-    for raw in lines[:, 0, :][:40]:
+    for raw in raws[:40]:
         x1, y1, x2, y2 = (float(v) for v in raw)
         if not (_inside_mask((x1, y1), mask) and _inside_mask((x2, y2), mask)):
             continue
