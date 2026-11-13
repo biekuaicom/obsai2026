@@ -16,6 +16,10 @@ from pcb_ar.core.grid_stitcher import (
     _compose,
     _fit_similarity,
     _match_constellation,
+    _overlap_geometry,
+    _rect_cover_count,
+    _roi_intersection,
+    _search_rough,
     stitch_grid_folder,
 )
 
@@ -291,3 +295,93 @@ def test_serpentine_stays_opt_in(tmp_path: Path):
     snake = stitch_grid_folder(paths, rows=2, cols=2, serpentine=True, step=step, max_side=4000)
     assert forward.placed == 4, forward.message
     assert snake.placed < 4, snake.message
+
+
+def _stamp_motif(scene: np.ndarray, x: int, y: int, tag: int) -> None:
+    cv2.rectangle(scene, (x, y), (x + 64 + tag * 6, y + 34), _INK, -1)
+    cv2.circle(scene, (x + 22, y + 56), 11, (0, 0, 0), -1)
+    cv2.line(scene, (x, y + 46), (x + 88, y + 50), _TRACE, 4)
+
+
+def test_measured_step_is_used_for_the_next_prediction():
+    size = (280, 180)
+    # 真实步长 200，overlap 猜测只有 140。第一对放下之后，第三张的预测必须改用测得步长。
+    true_step = 200.0
+    guess = 140.0
+    origin = 16.0
+    scene = np.full((260, 820, 3), _BOARD, np.uint8)
+    _stamp_motif(scene, int(origin + true_step + 8), 28, 0)
+    _stamp_motif(scene, int(origin + 2 * true_step + 8), 36, 2)
+    tiles = [_cut_tile(scene, (origin + i * true_step, 20.0), size, 0.0) for i in range(3)]
+    cells = _assign_cells(3, 1, 3, guess, 160.0, False)
+    _calibrate_grid(cells, tiles, guess, 160.0)
+    assert cells[0].accepted and cells[1].accepted and cells[2].accepted
+    assert cells[2].predicted_step is not None
+    measured = float(cells[2].predicted_step[0])
+    assert abs(measured - true_step) < 16.0, measured
+    assert abs(measured - guess) > 30.0
+    # 同一行不应留下明显的上下错位。
+    assert abs(float(cells[1].pose[1, 2] - cells[0].pose[1, 2])) < 2.0
+
+
+def test_coarse_search_does_not_maximize_overlap_area():
+    cover = np.zeros((150, 480), np.uint8)
+    cover[:, 20:240] = 255
+    width, height = 220, 120
+    expected_w = 44.0
+    rough_x = 240.0 - expected_w
+    rough_y = 12.0
+    found = _search_rough(
+        cover,
+        rough_x,
+        rough_y,
+        width,
+        height,
+        expected_overlap=(expected_w, float(height)),
+        axis="x",
+    )
+    assert found is not None
+    found_geom = _overlap_geometry(cover, found[0], found[1], width, height)
+    assert found_geom is not None
+    slide_x = 24.0
+    slide_area = _rect_cover_count(cover, slide_x, rough_y, width, height)
+    assert found_geom["area"] < slide_area
+    assert abs(found_geom["ow"] - expected_w) < 16.0
+    assert found[0] > slide_x + 80.0
+
+
+def test_rejected_tile_does_not_overwrite_frozen_overlap():
+    size = (280, 180)
+    scene = np.full((240, 520, 3), _BOARD, np.uint8)
+    _stamp_motif(scene, 150, 30, 1)
+    good = _cut_tile(scene, (12.0, 16.0), size, 0.0)
+    good[40:52, 150:162] = (0, 0, 255)
+    bad = np.full_like(good, (240, 240, 240))
+    bad[8:40, 8:40] = (255, 0, 255)
+    cells = _assign_cells(2, 1, 2, 150.0, 160.0, False)
+    frozen, _cover = _calibrate_grid(cells, [good, bad], 150.0, 160.0)
+    assert cells[0].accepted and not cells[1].accepted
+    red = (frozen[:, :, 2] > 240) & (frozen[:, :, 1] < 12) & (frozen[:, :, 0] < 12)
+    magenta = (frozen[:, :, 0] > 240) & (frozen[:, :, 1] < 12) & (frozen[:, :, 2] > 240)
+    assert int(np.count_nonzero(red)) >= 20
+    assert not np.any(magenta)
+
+
+def test_match_region_is_intersection_not_full_rectangle():
+    height, width = 90, 120
+    frozen = np.full((height, width * 2, 3), (10, 20, 30), np.uint8)
+    cover = np.zeros((height, width * 2), np.uint8)
+    cover[:, :70] = 255
+    image = np.full((height, width, 3), (0, 0, 200), np.uint8)
+    image[20:40, 10:30] = (0, 255, 0)
+    rough = np.array([[1.0, 0.0, 40.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    packed = _roi_intersection(frozen, cover, image, rough)
+    assert packed is not None
+    frozen_roi, new_roi, mask, _origin, _local = packed
+    assert int(np.count_nonzero(mask)) < mask.size
+    assert new_roi.shape[1] < image.shape[1]
+    assert mask.shape[0] * mask.shape[1] < image.shape[0] * image.shape[1]
+    assert np.all(new_roi[~mask] == 0)
+    assert np.all(frozen_roi[~mask] == 0)
+    # 交集大约是 x=40..70，而不是整幅 120 宽的预测矩形。
+    assert int(np.count_nonzero(mask)) < 50 * height

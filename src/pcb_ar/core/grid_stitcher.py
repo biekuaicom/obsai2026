@@ -3,7 +3,10 @@
 冻结拼图 + 交集 C + 形状星座，只求一次相似变换：
 
 * 第一张接受的图作为板面坐标原点，像素写入后不再改；
-* 后续每张只用行列预测粗足迹，C = 已冻结覆盖 ∩ 新图足迹；
+* 行列只用来预测粗足迹。一对邻居一旦放置成功，就用它们的中心距
+  更新这一方向的步长，后面的 C 用测得步长预测；
+* C = 已冻结覆盖 ∩ 这一次位姿假设的足迹（两邻居时自然是 L 或十字）。
+  冻结图和新图都先按 C 清零，再抽形状、再核对；
 * 只在 C 内提取孔、元件、焊盘、丝印、长走线，先按类型和尺寸配对，
   再用相对距离/角度做星座校验，估计完整相似变换（旋转、平移、轻微缩放）；
 * 形状太少时，才在同一 C 内用 ORB/ECC 作为二次测量，仍然只求一个相似变换；
@@ -42,6 +45,8 @@ class _Cell:
     col: int
     pose: np.ndarray
     accepted: bool = True
+    # 预测这一格时用的步长。第一对成功后会改成测得步长。
+    predicted_step: tuple[float, float] | None = None
 
 
 @dataclass
@@ -165,7 +170,9 @@ def _fit_similarity(src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
 
 
 def _shift_limit(width: int, height: int) -> float:
-    return max(100.0, 0.50 * float(min(width, height)))
+    # 只允许相似变换在当前候选足迹上做小修正。大的步长误差交给候选，
+    # 不能靠把新图滑进旧图来凑重叠面积。
+    return max(40.0, 0.14 * float(min(width, height)))
 
 
 def _center_shift(pose: np.ndarray, rough: np.ndarray, width: int, height: int) -> float:
@@ -831,31 +838,96 @@ def _rect_cover_count(cover: np.ndarray, x: float, y: float, width: int, height:
     return int(np.count_nonzero(cover[y0:y1, x0:x1]))
 
 
+def _overlap_geometry(
+    cover: np.ndarray,
+    tx: float,
+    ty: float,
+    width: int,
+    height: int,
+) -> dict[str, float] | None:
+    """轴对齐足迹和已冻结覆盖的交集。面积最大不等于正确的重叠带。"""
+    canvas_h, canvas_w = cover.shape[:2]
+    x0 = int(math.floor(tx))
+    y0 = int(math.floor(ty))
+    x1 = int(math.ceil(tx + width))
+    y1 = int(math.ceil(ty + height))
+    ix0, iy0 = max(0, x0), max(0, y0)
+    ix1, iy1 = min(canvas_w, x1), min(canvas_h, y1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None
+    region = cover[iy0:iy1, ix0:ix1] > 0
+    area = int(np.count_nonzero(region))
+    if area < 1:
+        return None
+    ys, xs = np.where(region)
+    return {
+        "area": float(area),
+        "frac": area / float(width * height),
+        "ow": float(int(xs.max()) - int(xs.min()) + 1),
+        "oh": float(int(ys.max()) - int(ys.min()) + 1),
+        "mean_local_x": float(xs.mean() + ix0 - tx),
+        "mean_local_y": float(ys.mean() + iy0 - ty),
+    }
+
+
+def _strip_cost(
+    geom: dict[str, float],
+    expected_overlap: tuple[float, float],
+    axis: str,
+    shift_x: float,
+    shift_y: float,
+) -> float | None:
+    """越接近期望重叠带越好。重叠面积更大不能加分，滑进旧图直接丢掉。"""
+    if geom["frac"] < 0.05 or geom["frac"] > 0.62:
+        return None
+    expect_w, expect_h = expected_overlap
+    if axis == "y":
+        cost = abs(geom["oh"] - expect_h) + 0.25 * abs(geom["ow"] - expect_w)
+    elif axis == "xy":
+        cost = abs(geom["ow"] - expect_w) + abs(geom["oh"] - expect_h)
+    else:
+        cost = abs(geom["ow"] - expect_w) + 0.25 * abs(geom["oh"] - expect_h)
+    # 只在分数相近时偏向更小的位移，不偏向更大的面积。
+    return float(cost + 0.015 * math.hypot(shift_x, shift_y))
+
+
 def _search_rough(
     cover: np.ndarray,
     rough_x: float,
     rough_y: float,
     width: int,
     height: int,
-    minimum: int,
+    *,
+    expected_overlap: tuple[float, float],
+    axis: str = "x",
 ) -> tuple[float, float] | None:
-    base = _rect_cover_count(cover, rough_x, rough_y, width, height)
-    if base >= minimum:
-        return rough_x, rough_y
-    radius = 0.20 * float(min(width, height))
-    step = max(8.0, radius / 5.0)
-    best = base
-    found = None
-    offsets = np.arange(-radius, radius + 1e-6, step)
-    for dy in offsets:
-        for dx in offsets:
-            area = _rect_cover_count(cover, rough_x + float(dx), rough_y + float(dy), width, height)
-            if area > best:
-                best = area
-                found = (rough_x + float(dx), rough_y + float(dy))
-    if found is None or best < minimum:
+    """粗搜索：目标是邻居方向上的期望重叠带，不是覆盖面积最大的位置。"""
+    ys, xs = np.where(cover > 0)
+    if xs.size == 0:
         return None
-    return found
+    stride_x = max(4.0, width * 0.03)
+    stride_y = max(4.0, height * 0.03)
+    if axis == "y":
+        y_vals = np.arange(float(ys.min()) - height + 4.0, float(ys.max()) - 4.0, stride_y)
+        x_vals = np.arange(rough_x - 12.0, rough_x + 12.1, 6.0)
+    else:
+        x_vals = np.arange(float(xs.min()) - width + 4.0, float(xs.max()) - 4.0, stride_x)
+        y_vals = np.arange(rough_y - 12.0, rough_y + 12.1, 6.0)
+    best: tuple[float, float] | None = None
+    best_cost = 1e18
+    for dy in y_vals:
+        for dx in x_vals:
+            x = float(dx)
+            y = float(dy)
+            geom = _overlap_geometry(cover, x, y, width, height)
+            if geom is None:
+                continue
+            cost = _strip_cost(geom, expected_overlap, axis, x - rough_x, y - rough_y)
+            if cost is None or cost >= best_cost:
+                continue
+            best_cost = cost
+            best = (x, y)
+    return best
 
 
 def _roi_intersection(
@@ -890,9 +962,78 @@ def _roi_intersection(
     cmask = (cover[y0:y1, x0:x1] > 0) & (foot > 0)
     if int(np.count_nonzero(cmask)) < 400:
         return None
+    # 工作区收成 C 的外接框，并把 C 以外清零。不能在整块预测矩形上抽形状或做 NCC。
     frozen_roi = frozen[y0:y1, x0:x1].copy()
     new_roi = _sample_tile(image, rough, (x0, y0), roi_size)
-    return frozen_roi, new_roi, cmask, (x0, y0), local
+    frozen_roi[~cmask] = 0
+    new_roi[~cmask] = 0
+    ys, xs = np.where(cmask)
+    # 收到 C 的外接框，并留几像素空边，避免形状中心贴在裁切边上被丢掉。
+    # 空边仍在掩膜外，是 0，不把整块预测矩形交进去匹配。
+    pad = 6
+    bx0 = max(0, int(xs.min()) - pad)
+    by0 = max(0, int(ys.min()) - pad)
+    bx1 = min(cmask.shape[1], int(xs.max()) + 1 + pad)
+    by1 = min(cmask.shape[0], int(ys.max()) + 1 + pad)
+    local = local.copy()
+    local[0, 2] -= float(bx0)
+    local[1, 2] -= float(by0)
+    return (
+        frozen_roi[by0:by1, bx0:bx1].copy(),
+        new_roi[by0:by1, bx0:bx1].copy(),
+        cmask[by0:by1, bx0:bx1].copy(),
+        (x0 + bx0, y0 + by0),
+        local,
+    )
+
+
+def _tighten_vertical(
+    frozen_roi: np.ndarray,
+    image: np.ndarray,
+    pose: np.ndarray,
+    origin: tuple[int, int],
+    mask: np.ndarray,
+    point_pairs: list[tuple[np.ndarray, np.ndarray]],
+    inv_local: np.ndarray,
+) -> np.ndarray:
+    """在同一块 C 里只微调竖直平移，收紧 A/B 接缝的高度残差。旋转和缩放保持不变。"""
+    pose = pose.copy()
+
+    def _vertical_error(candidate: np.ndarray) -> float:
+        if len(point_pairs) < 2:
+            return 0.0
+        errors = []
+        oy = float(origin[1])
+        for frozen_pt, new_pt in point_pairs:
+            canvas = _apply(candidate, _apply(inv_local, new_pt))
+            errors.append(float(canvas[1] - (oy + float(frozen_pt[1]))))
+        return abs(float(np.median(errors)))
+
+    # 点够多时才用中心残差改 ty。两点拟合已经把这两个中心对齐，再挪会把旋转角带偏。
+    if len(point_pairs) >= 4:
+        signed = []
+        oy = float(origin[1])
+        for frozen_pt, new_pt in point_pairs:
+            canvas = _apply(pose, _apply(inv_local, new_pt))
+            signed.append(float(canvas[1] - (oy + float(frozen_pt[1]))))
+        shift = float(np.median(signed))
+        if 0.6 <= abs(shift) <= 4.0:
+            pose[1, 2] -= shift
+    base = _sample_tile(image, pose, origin, (mask.shape[1], mask.shape[0]))
+    best_ncc = _ncc(_gray(frozen_roi), _gray(base), mask)
+    anchor_limit = max(1.0, _vertical_error(pose) + 0.4)
+    best = pose
+    for dy in (-3.0, -2.0, -1.0, 1.0, 2.0, 3.0):
+        trial = pose.copy()
+        trial[1, 2] += dy
+        if _vertical_error(trial) > anchor_limit:
+            continue
+        warped = _sample_tile(image, trial, origin, (mask.shape[1], mask.shape[0]))
+        score = _ncc(_gray(frozen_roi), _gray(warped), mask)
+        if score > best_ncc + 0.02:
+            best_ncc = score
+            best = trial
+    return best
 
 
 def _align_tile(
@@ -938,6 +1079,7 @@ def _align_tile(
     pose = _pose_from_roi_pairs(point_pairs, inv_local, origin)
     if pose is None:
         return None
+    pose = _tighten_vertical(frozen_roi, image, pose, origin, cmask, point_pairs, inv_local)
     height, width = image.shape[:2]
     if _center_shift(pose, rough, width, height) > _shift_limit(width, height):
         return None
@@ -1027,11 +1169,190 @@ def _assign_cells(
             if index >= count:
                 break
             pose = np.array([[1.0, 0.0, col * dx], [0.0, 1.0, row * dy]], dtype=np.float64)
-            cells.append(_Cell(index, row, col, pose, True))
+            cells.append(_Cell(index, row, col, pose, False))
             index += 1
         if index >= count:
             break
     return cells
+
+
+def _tile_center(cell: _Cell, image: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    return _apply(cell.pose, np.array([(width - 1) / 2.0, (height - 1) / 2.0], dtype=np.float64))
+
+
+def _measured_steps(
+    accepted: list[_Cell],
+    images: list[np.ndarray],
+    dx: float,
+    dy: float,
+) -> tuple[float, float]:
+    """相邻已接受格子的中心距。有观测之后不再沿用 overlap 参数的猜测。"""
+    dxs: list[float] = []
+    dys: list[float] = []
+    for i, left in enumerate(accepted):
+        for right in accepted[i + 1 :]:
+            if left.row == right.row and abs(left.col - right.col) == 1:
+                a = _tile_center(left, images[left.index])
+                b = _tile_center(right, images[right.index])
+                dxs.append(float(b[0] - a[0]) / float(right.col - left.col))
+            if left.col == right.col and abs(left.row - right.row) == 1:
+                a = _tile_center(left, images[left.index])
+                b = _tile_center(right, images[right.index])
+                dys.append(float(b[1] - a[1]) / float(right.row - left.row))
+    if dxs:
+        dx = float(np.median(dxs))
+    if dys:
+        dy = float(np.median(dys))
+    return dx, dy
+
+
+def _nearest_neighbor(cell: _Cell, accepted: list[_Cell], axis: str) -> _Cell | None:
+    best: _Cell | None = None
+    best_d = 10**9
+    for other in accepted:
+        if not other.accepted:
+            continue
+        if axis == "x" and other.row == cell.row and other.col != cell.col:
+            dist = abs(other.col - cell.col)
+        elif axis == "y" and other.col == cell.col and other.row != cell.row:
+            dist = abs(other.row - cell.row)
+        else:
+            continue
+        if dist < best_d:
+            best = other
+            best_d = dist
+    return best
+
+
+def _predict_top_left(
+    cell: _Cell,
+    accepted: list[_Cell],
+    images: list[np.ndarray],
+    dx: float,
+    dy: float,
+    pad_x: float,
+    pad_y: float,
+    width: int,
+    height: int,
+) -> tuple[float, float, _Cell | None, _Cell | None]:
+    horiz = _nearest_neighbor(cell, accepted, "x")
+    vert = _nearest_neighbor(cell, accepted, "y")
+    centers_x: list[float] = []
+    centers_y: list[float] = []
+    if horiz is not None:
+        center = _tile_center(horiz, images[horiz.index])
+        centers_x.append(float(center[0] + (cell.col - horiz.col) * dx))
+        centers_y.append(float(center[1] + (cell.row - horiz.row) * dy))
+    if vert is not None:
+        center = _tile_center(vert, images[vert.index])
+        centers_x.append(float(center[0] + (cell.col - vert.col) * dx))
+        centers_y.append(float(center[1] + (cell.row - vert.row) * dy))
+    if not centers_x:
+        centers_x.append(pad_x + cell.col * dx + (width - 1) / 2.0)
+        centers_y.append(pad_y + cell.row * dy + (height - 1) / 2.0)
+    # 两个邻居时取平均，仍然只产生一个位姿假设，C 由这个足迹和覆盖相交得到。
+    cx = float(np.mean(centers_x))
+    cy = float(np.mean(centers_y))
+    return cx - (width - 1) / 2.0, cy - (height - 1) / 2.0, horiz, vert
+
+
+def _plausible_steps(length: int, preferred: float) -> list[float]:
+    """重叠大约 8%–45% 的步长，按离期望步长的距离排序。不包含滑进旧图的更短步长。"""
+    lo = float(length) * (1.0 - 0.45)
+    hi = float(length) * (1.0 - 0.08)
+    stride = max(12.0, float(length) * 0.03)
+    values = [float(v) for v in np.arange(lo, hi + stride * 0.5, stride)]
+    values.append(float(preferred))
+    unique: list[float] = []
+    for value in values:
+        if all(abs(value - old) > 1.0 for old in unique):
+            unique.append(value)
+    unique.sort(key=lambda item: (abs(item - preferred), item))
+    return unique
+
+
+def _coarse_candidates(
+    cell: _Cell,
+    images: list[np.ndarray],
+    cover: np.ndarray,
+    pred_x: float,
+    pred_y: float,
+    dx: float,
+    dy: float,
+    width: int,
+    height: int,
+    horiz: _Cell | None,
+    vert: _Cell | None,
+) -> list[tuple[float, float]]:
+    """按期望重叠带排序的候选足迹。重叠超过半幅的位置直接丢掉。"""
+    raw: list[tuple[float, float, float]] = []
+    # 单邻居是一条重叠带，不能超过半幅；两个邻居的 L/十字面积可以更大，
+    # 但仍然丢掉几乎整幅盖住旧图的位置。
+    frac_cap = 0.80 if horiz is not None and vert is not None else 0.62
+
+    def consider(tx: float, ty: float, step_cost: float) -> None:
+        geom = _overlap_geometry(cover, tx, ty, width, height)
+        if geom is None or geom["frac"] < 0.05 or geom["frac"] > frac_cap:
+            return
+        raw.append((step_cost, tx, ty))
+
+    if horiz is not None:
+        dcol = cell.col - horiz.col
+        anchor = _tile_center(horiz, images[horiz.index])
+        for step in _plausible_steps(width, abs(dx) if abs(dx) > 1.0 else width * 0.7):
+            cx = float(anchor[0] + dcol * step)
+            cy = float(anchor[1])
+            tx = cx - (width - 1) / 2.0
+            ty = cy - (height - 1) / 2.0
+            consider(tx, ty, abs(step - abs(dx)))
+            if abs(step - abs(dx)) < 1.5:
+                for jitter in (-10.0, 10.0):
+                    consider(tx, ty + jitter, abs(step - abs(dx)) + 0.5)
+    elif vert is not None:
+        drow = cell.row - vert.row
+        anchor = _tile_center(vert, images[vert.index])
+        for step in _plausible_steps(height, abs(dy) if abs(dy) > 1.0 else height * 0.7):
+            cx = float(anchor[0])
+            cy = float(anchor[1] + drow * step)
+            tx = cx - (width - 1) / 2.0
+            ty = cy - (height - 1) / 2.0
+            consider(tx, ty, abs(step - abs(dy)))
+            if abs(step - abs(dy)) < 1.5:
+                for jitter in (-10.0, 10.0):
+                    consider(tx + jitter, ty, abs(step - abs(dy)) + 0.5)
+    else:
+        consider(pred_x, pred_y, 0.0)
+    if horiz is not None and vert is not None:
+        # 十字/L：横竖步长各自取靠近测得值的几档，不在二维上把图滑进已冻结区域。
+        dcol = cell.col - horiz.col
+        drow = cell.row - vert.row
+        hcenter = _tile_center(horiz, images[horiz.index])
+        vcenter = _tile_center(vert, images[vert.index])
+        x_steps = _plausible_steps(width, abs(dx) if abs(dx) > 1.0 else width * 0.7)[:6]
+        y_steps = _plausible_steps(height, abs(dy) if abs(dy) > 1.0 else height * 0.7)[:4]
+        for sx in x_steps:
+            for sy in y_steps:
+                cx = float(hcenter[0] + dcol * sx)
+                cy = float(vcenter[1] + drow * sy)
+                consider(
+                    cx - (width - 1) / 2.0,
+                    cy - (height - 1) / 2.0,
+                    abs(sx - abs(dx)) + abs(sy - abs(dy)),
+                )
+    consider(pred_x, pred_y, -0.1)
+    raw.sort(key=lambda item: item[0])
+    ordered: list[tuple[float, float]] = []
+    seen: set[tuple[int, int]] = set()
+    for _cost, tx, ty in raw:
+        key = (int(round(tx)), int(round(ty)))
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append((tx, ty))
+        if len(ordered) >= 16:
+            break
+    return ordered
 
 
 def _calibrate_grid(
@@ -1048,8 +1369,11 @@ def _calibrate_grid(
     pad_x = int(0.22 * max_w + 12)
     pad_y = int(0.22 * max_h + 12)
     extra = int(0.28 * min(max_w, max_h) + 24)
-    width = int(math.ceil(pad_x + max(c.col * dx + images[c.index].shape[1] for c in cells) + extra))
-    height = int(math.ceil(pad_y + max(c.row * dy + images[c.index].shape[0] for c in cells) + extra))
+    # 画布按可能的大步长留空。测得步长比 overlap 猜测更大时不能裁掉后面的图。
+    pitch_x = max(abs(dx), 0.92 * max_w)
+    pitch_y = max(abs(dy), 0.92 * max_h)
+    width = int(math.ceil(pad_x + max(c.col * pitch_x + images[c.index].shape[1] for c in cells) + extra))
+    height = int(math.ceil(pad_y + max(c.row * pitch_y + images[c.index].shape[0] for c in cells) + extra))
     frozen = np.zeros((height, width, 3), np.uint8)
     cover = np.zeros((height, width), np.uint8)
 
@@ -1059,30 +1383,36 @@ def _calibrate_grid(
     cover[pad_y : pad_y + fh, pad_x : pad_x + fw] = 255
     first.pose = np.array([[1.0, 0.0, float(pad_x)], [0.0, 1.0, float(pad_y)]], dtype=np.float64)
     first.accepted = True
+    first.predicted_step = (float(dx), float(dy))
+    dx_hat, dy_hat = float(dx), float(dy)
 
     for cell in cells[1:]:
         image = images[cell.index]
         ih, iw = image.shape[:2]
-        rough_x = float(pad_x) + cell.col * dx
-        rough_y = float(pad_y) + cell.row * dy
-        minimum = max(900, int(0.05 * iw * ih))
-        searched = _search_rough(cover, rough_x, rough_y, iw, ih, minimum)
-        if searched is None:
+        accepted = [item for item in cells if item.accepted]
+        dx_hat, dy_hat = _measured_steps(accepted, images, dx_hat, dy_hat)
+        cell.predicted_step = (dx_hat, dy_hat)
+        pred_x, pred_y, horiz, vert = _predict_top_left(
+            cell, accepted, images, dx_hat, dy_hat, float(pad_x), float(pad_y), iw, ih
+        )
+        candidates = _coarse_candidates(
+            cell, images, cover, pred_x, pred_y, dx_hat, dy_hat, iw, ih, horiz, vert
+        )
+        placed = False
+        for tx, ty in candidates:
+            rough = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty]], dtype=np.float64)
+            pose = _align_tile(frozen, cover, image, rough)
+            if pose is None:
+                continue
+            if _center_shift(pose, rough, iw, ih) > _shift_limit(iw, ih):
+                continue
+            cell.pose = pose
+            cell.accepted = True
+            _paste_exclusive(frozen, cover, image, pose, erode=True)
+            placed = True
+            break
+        if not placed:
             cell.accepted = False
-            continue
-        rough = np.array([[1.0, 0.0, searched[0]], [0.0, 1.0, searched[1]]], dtype=np.float64)
-        # 门限相对原始网格，而不是搜索后的足迹，避免被拉到远处的重复结构。
-        pose = _align_tile(frozen, cover, image, rough)
-        if pose is None:
-            cell.accepted = False
-            continue
-        original = np.array([[1.0, 0.0, rough_x], [0.0, 1.0, rough_y]], dtype=np.float64)
-        if _center_shift(pose, original, iw, ih) > _shift_limit(iw, ih):
-            cell.accepted = False
-            continue
-        cell.pose = pose
-        cell.accepted = True
-        _paste_exclusive(frozen, cover, image, pose, erode=True)
 
     accepted = [cell for cell in cells if cell.accepted]
     if accepted:
