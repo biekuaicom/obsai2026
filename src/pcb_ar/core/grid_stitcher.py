@@ -7,8 +7,11 @@
   更新这一方向的步长，后面的 C 用测得步长预测；
 * C = 已冻结覆盖 ∩ 这一次位姿假设的足迹（两邻居时自然是 L 或十字）。
   冻结图和新图都先按 C 清零，再抽形状、再核对；
-* 只在 C 内提取孔、元件、焊盘、丝印、长走线，先按类型和尺寸配对，
-  再用相对距离/角度做星座校验，估计完整相似变换（旋转、平移、轻微缩放）；
+* 识别前先裁掉每张图外圈 2px。位姿、交集和成图都只用裁后的画面；
+* C 里的对边（位置、方向、两端点）或一个独一无二的三角形，一次求出
+  旋转、平移和轻微缩放。一条边或两条平行边都不够；
+* 重复形状按从上到下、从左到右，取第一个没有相同副本的作为参照。
+  周期焊盘不能单独决定位姿；
 * 形状太少时，才在同一 C 内用 ORB/ECC 作为二次测量，仍然只求一个相似变换；
 * 核对失败就拒绝：不改已冻结位姿，不把该图写入冻结图或覆盖；
 * 通过后只把新图独占像素并入冻结图，重叠区保持先接受的参考。
@@ -71,6 +74,25 @@ _KIND_WEIGHT = {"hole": 6.0, "component": 5.0, "trace": 3.0, "silk": 1.6, "pad":
 _MAX_ROT_DEG = 6.5
 _SCALE_MIN = 0.94
 _SCALE_MAX = 1.06
+_EDGE_INSET = 2
+_RECOGNITION_FRAMES: set[int] = set()
+
+
+def _crop_recognition_frame(image: np.ndarray) -> np.ndarray:
+    """去掉外圈两像素。相机边缘不稳定，不能进入位姿或成图。"""
+    height, width = image.shape[:2]
+    if height <= _EDGE_INSET * 2 + 2 or width <= _EDGE_INSET * 2 + 2:
+        return image
+    return np.ascontiguousarray(image[_EDGE_INSET:-_EDGE_INSET, _EDGE_INSET:-_EDGE_INSET])
+
+
+def _ensure_recognition_frame(image: np.ndarray) -> np.ndarray:
+    """同一张数组只裁一次，避免拼接入口和标定入口各裁一圈。"""
+    if id(image) in _RECOGNITION_FRAMES:
+        return image
+    cropped = _crop_recognition_frame(image)
+    _RECOGNITION_FRAMES.add(id(cropped))
+    return cropped
 
 
 def _apply(matrix: np.ndarray, point: np.ndarray) -> np.ndarray:
@@ -301,19 +323,24 @@ def _hough_holes(gray: np.ndarray, mask: np.ndarray, median: float) -> list[_Sha
     return found
 
 
-def _traces(gray: np.ndarray, mask: np.ndarray) -> list[_Shape]:
+def _hough_raws(gray: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, float]:
+    """HoughLinesP 线段。4.12 有的构建是 (N, 4)，有的仍是 (N, 1, 4)。"""
     edges = cv2.Canny(gray, 40, 120)
     edges[mask == 0] = 0
-    h, w = gray.shape[:2]
-    min_len = max(36, int(0.12 * min(h, w)))
+    height, width = gray.shape[:2]
+    min_len = max(36, int(0.12 * min(height, width)))
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold=28, minLineLength=min_len, maxLineGap=8)
     if lines is None:
-        return []
-    # OpenCV 4.12 有的构建返回 (N, 4)，有的仍是 (N, 1, 4)。
+        return np.zeros((0, 4), dtype=np.float64), float(min_len)
     packed = np.asarray(lines)
     raws = packed[:, 0, :] if packed.ndim == 3 else packed.reshape(-1, 4)
+    return raws[:40].astype(np.float64), float(min_len)
+
+
+def _traces(gray: np.ndarray, mask: np.ndarray) -> list[_Shape]:
+    raws, min_len = _hough_raws(gray, mask)
     shapes: list[_Shape] = []
-    for raw in raws[:40]:
+    for raw in raws:
         x1, y1, x2, y2 = (float(v) for v in raw)
         if not (_inside_mask((x1, y1), mask) and _inside_mask((x2, y2), mask)):
             continue
@@ -801,6 +828,7 @@ def _verify_content(
     *,
     anchor_hits: int,
     sizes_ok: bool,
+    min_ncc: float = 0.0,
 ) -> bool:
     if not sizes_ok or residual > 4.0:
         return False
@@ -824,16 +852,18 @@ def _verify_content(
         return False
     ncc = _ncc(_gray(frozen_roi), _gray(warped), refined)
     edges = _edge_iou(_gray(frozen_roi), _gray(warped), refined)
+    if ncc < min_ncc:
+        return False
     if anchor_hits >= 2 and residual <= 2.6 and ncc >= 0.45:
         return True
-    # 窄 C 里孔/元件可能抽不准。残差已经很小、相关过得去时，ORB 位姿可以过。
-    if residual <= 2.2 and ncc >= 0.50:
+    # 窄 C 里孔/元件可能抽不准。残差很小且相关明显高于无关图时，ORB 位姿可以过。
+    if residual <= 1.6 and ncc >= 0.54:
         return True
     if ncc >= 0.55 and residual <= 3.6:
         return True
     if ncc >= 0.72:
         return True
-    if ncc >= 0.40 and edges >= 0.16 and residual <= 3.0 and anchor_hits >= 2:
+    if ncc >= 0.55 and edges >= 0.16 and residual <= 3.0 and anchor_hits >= 2:
         return True
     return False
 
@@ -998,53 +1028,173 @@ def _roi_intersection(
     )
 
 
-def _tighten_vertical(
-    frozen_roi: np.ndarray,
-    image: np.ndarray,
-    pose: np.ndarray,
-    origin: tuple[int, int],
-    mask: np.ndarray,
-    point_pairs: list[tuple[np.ndarray, np.ndarray]],
-    inv_local: np.ndarray,
-) -> np.ndarray:
-    """在同一块 C 里只微调竖直平移，收紧 A/B 接缝的高度残差。旋转和缩放保持不变。"""
-    pose = pose.copy()
+@dataclass
+class _Edge:
+    """C 内一条边：位置、方向、两个端点。"""
 
-    def _vertical_error(candidate: np.ndarray) -> float:
-        if len(point_pairs) < 2:
-            return 0.0
-        errors = []
-        oy = float(origin[1])
-        for frozen_pt, new_pt in point_pairs:
-            canvas = _apply(candidate, _apply(inv_local, new_pt))
-            errors.append(float(canvas[1] - (oy + float(frozen_pt[1]))))
-        return abs(float(np.median(errors)))
+    a: np.ndarray
+    b: np.ndarray
 
-    # 点够多时才用中心残差改 ty。两点拟合已经把这两个中心对齐，再挪会把旋转角带偏。
-    if len(point_pairs) >= 4:
-        signed = []
-        oy = float(origin[1])
-        for frozen_pt, new_pt in point_pairs:
-            canvas = _apply(pose, _apply(inv_local, new_pt))
-            signed.append(float(canvas[1] - (oy + float(frozen_pt[1]))))
-        shift = float(np.median(signed))
-        if 0.6 <= abs(shift) <= 4.0:
-            pose[1, 2] -= shift
-    base = _sample_tile(image, pose, origin, (mask.shape[1], mask.shape[0]))
-    best_ncc = _ncc(_gray(frozen_roi), _gray(base), mask)
-    anchor_limit = max(1.0, _vertical_error(pose) + 0.4)
-    best = pose
-    for dy in (-3.0, -2.0, -1.0, 1.0, 2.0, 3.0):
-        trial = pose.copy()
-        trial[1, 2] += dy
-        if _vertical_error(trial) > anchor_limit:
+    @property
+    def length(self) -> float:
+        return float(np.hypot(*(self.b - self.a)))
+
+    @property
+    def angle(self) -> float:
+        return math.atan2(float(self.b[1] - self.a[1]), float(self.b[0] - self.a[0])) % math.pi
+
+
+def _edges_from_hough(gray: np.ndarray, mask: np.ndarray) -> list[_Edge]:
+    raws, min_len = _hough_raws(gray, mask)
+    found: list[_Edge] = []
+    for raw in raws:
+        p1 = np.array([float(raw[0]), float(raw[1])], dtype=np.float64)
+        p2 = np.array([float(raw[2]), float(raw[3])], dtype=np.float64)
+        if not (_inside_mask((float(p1[0]), float(p1[1])), mask) and _inside_mask((float(p2[0]), float(p2[1])), mask)):
             continue
-        warped = _sample_tile(image, trial, origin, (mask.shape[1], mask.shape[0]))
-        score = _ncc(_gray(frozen_roi), _gray(warped), mask)
-        if score > best_ncc + 0.02:
-            best_ncc = score
-            best = trial
+        edge = _Edge(p1, p2)
+        if edge.length >= min_len:
+            found.append(edge)
+    return found
+
+
+def _reading_key(shape: _Shape) -> tuple[float, float]:
+    return (float(shape.center[1]), float(shape.center[0]))
+
+
+def _same_identity(a: _Shape, b: _Shape) -> bool:
+    if a.kind != b.kind or a.kind == "pad":
+        return False
+    return _size_similar(a, b)
+
+
+def _unique_reference_shapes(shapes: list[_Shape]) -> list[_Shape]:
+    """从上到下、从左到右。有相同副本的形状全部丢掉。"""
+    ordered = sorted((shape for shape in shapes if shape.kind != "pad"), key=_reading_key)
+    return [
+        shape
+        for shape in ordered
+        if not any(_same_identity(shape, other) for other in ordered if other is not shape)
+    ]
+
+
+def _rect_corners(shape: _Shape) -> list[np.ndarray]:
+    cos_t, sin_t = math.cos(shape.angle), math.sin(shape.angle)
+    major = np.array([cos_t, sin_t], dtype=np.float64) * (shape.major / 2.0)
+    minor = np.array([-sin_t, cos_t], dtype=np.float64) * (shape.minor / 2.0)
+    center = np.asarray(shape.center, dtype=np.float64)
+    return [
+        center - major - minor,
+        center + major - minor,
+        center + major + minor,
+        center - major + minor,
+    ]
+
+
+def _point_residual(matrix: np.ndarray, src: np.ndarray, dst: np.ndarray) -> float:
+    pred = (matrix[:, :2] @ src.T).T + matrix[:, 2]
+    return float(np.median(np.linalg.norm(pred - dst, axis=1)))
+
+
+def _fit_edge_pair(e1: _Edge, f1: _Edge, e2: _Edge, f2: _Edge) -> tuple[float, list[tuple[np.ndarray, np.ndarray]]] | None:
+    if _angle_delta(e1.angle, e2.angle) < math.radians(18.0):
+        return None
+    best: tuple[float, list[tuple[np.ndarray, np.ndarray]]] | None = None
+    for flip1 in (False, True):
+        for flip2 in (False, True):
+            src = np.vstack([
+                e1.b if flip1 else e1.a,
+                e1.a if flip1 else e1.b,
+                e2.b if flip2 else e2.a,
+                e2.a if flip2 else e2.b,
+            ])
+            dst = np.vstack([f1.a, f1.b, f2.a, f2.b])
+            matrix = _fit_similarity(src, dst)
+            if matrix is None:
+                continue
+            residual = _point_residual(matrix, src, dst)
+            pairs = [(src[k].copy(), dst[k].copy()) for k in range(4)]
+            if best is None or residual < best[0]:
+                best = (residual, pairs)
+    if best is None or best[0] > 2.5:
+        return None
     return best
+
+
+def _match_mutual_edges(src: list[_Edge], dst: list[_Edge]) -> list[tuple[np.ndarray, np.ndarray]] | None:
+    """至少两条不平行的对边，用两端点一次拟合。平行线对返回空。"""
+    cands: list[tuple[int, int]] = []
+    for i, edge in enumerate(src):
+        for j, other in enumerate(dst):
+            if min(edge.length, other.length) < 18.0:
+                continue
+            ratio = max(edge.length, other.length) / min(edge.length, other.length)
+            if ratio <= 1.28:
+                cands.append((i, j))
+    best: tuple[float, list[tuple[np.ndarray, np.ndarray]]] | None = None
+    for p in range(len(cands)):
+        i1, j1 = cands[p]
+        for q in range(p + 1, len(cands)):
+            i2, j2 = cands[q]
+            if i1 == i2 or j1 == j2:
+                continue
+            solved = _fit_edge_pair(src[i1], dst[j1], src[i2], dst[j2])
+            if solved is None:
+                continue
+            residual, pairs = solved
+            if best is None or residual < best[0]:
+                best = (residual, pairs)
+    if best is None:
+        return None
+    return best[1]
+
+
+def _match_unique_triangle(src: list[_Shape], dst: list[_Shape]) -> list[tuple[np.ndarray, np.ndarray]] | None:
+    """阅读顺序里的第一个独一无二元件，用三个角点一次锁定。"""
+    src_unique = [shape for shape in _unique_reference_shapes(src) if shape.kind in _ANCHORS]
+    dst_unique = [shape for shape in _unique_reference_shapes(dst) if shape.kind in _ANCHORS]
+    paired: list[tuple[_Shape, _Shape]] = []
+    used: set[int] = set()
+    for shape in src_unique:
+        for index, other in enumerate(dst_unique):
+            if index in used or shape.kind != other.kind or not _size_similar(shape, other):
+                continue
+            paired.append((shape, other))
+            used.add(index)
+            break
+    for shape, other in paired:
+        if shape.kind != "component" or min(shape.major, shape.minor) < 10.0:
+            continue
+        src_corners = _rect_corners(shape)
+        dst_corners = _rect_corners(other)
+        best: tuple[float, list[tuple[np.ndarray, np.ndarray]]] | None = None
+        for turn in range(4):
+            ordered = [dst_corners[(turn + k) % 4] for k in range(3)]
+            src_pts = np.vstack(src_corners[:3])
+            dst_pts = np.vstack(ordered)
+            matrix = _fit_similarity(src_pts, dst_pts)
+            if matrix is None:
+                continue
+            residual = _point_residual(matrix, src_pts, dst_pts)
+            pairs = [(src_pts[k].copy(), dst_pts[k].copy()) for k in range(3)]
+            if best is None or residual < best[0]:
+                best = (residual, pairs)
+        if best is not None and best[0] <= 3.0:
+            return best[1]
+    if len(paired) < 3:
+        return None
+    src_pts = np.vstack([item[0].center for item in paired[:3]])
+    dst_pts = np.vstack([item[1].center for item in paired[:3]])
+    area = abs(
+        (src_pts[1, 0] - src_pts[0, 0]) * (src_pts[2, 1] - src_pts[0, 1])
+        - (src_pts[1, 1] - src_pts[0, 1]) * (src_pts[2, 0] - src_pts[0, 0])
+    ) / 2.0
+    if area < 40.0:
+        return None
+    matrix = _fit_similarity(src_pts, dst_pts)
+    if matrix is None or _point_residual(matrix, src_pts, dst_pts) > 3.0:
+        return None
+    return [(src_pts[k].copy(), dst_pts[k].copy()) for k in range(3)]
 
 
 def _align_tile(
@@ -1061,71 +1211,95 @@ def _align_tile(
     frozen_s, new_s, mask_s, analysis = _resize_for_analysis(frozen_roi, new_roi, cmask)
     src_shapes = _scale_shapes(_extract_shapes(frozen_s, mask_s), analysis)
     dst_shapes = _scale_shapes(_extract_shapes(new_s, mask_s), analysis)
-    point_pairs: list[tuple[np.ndarray, np.ndarray]] = []
-    anchor_hits = 0
-    sizes_ok = True
-    shape_locked = False
+    # 一次求出旋转和平移。不先锁横向再单独改竖直。
+    hypotheses: list[tuple[list[tuple[np.ndarray, np.ndarray]], int, bool, float]] = []
+    edge_pairs = _match_mutual_edges(_edges_from_hough(frozen_s, mask_s), _edges_from_hough(new_s, mask_s))
+    if edge_pairs is not None and analysis != 1.0:
+        edge_pairs = [(np.asarray(a, dtype=np.float64) / analysis, np.asarray(b, dtype=np.float64) / analysis) for a, b in edge_pairs]
+    if edge_pairs:
+        hypotheses.append((edge_pairs, 0, True, 0.68))
+    triangle_pairs = _match_unique_triangle(src_shapes, dst_shapes)
+    if triangle_pairs:
+        hypotheses.append((triangle_pairs, 0, True, 0.68))
     matched = _match_constellation(src_shapes, dst_shapes)
     if matched is not None and _sizes_agree(src_shapes, dst_shapes, matched.pairs):
-        point_pairs = [(src_shapes[i].center.copy(), dst_shapes[j].center.copy()) for i, j in matched.pairs]
-        anchor_hits = matched.anchor_hits
-        shape_locked = True
+        hypotheses.append(
+            (
+                [(src_shapes[i].center.copy(), dst_shapes[j].center.copy()) for i, j in matched.pairs],
+                matched.anchor_hits,
+                True,
+                0.0,
+            )
+        )
     else:
         orb = _orb_match(_gray(frozen_s), _gray(new_s), mask_s)
-        if orb is None:
-            return None
-        matrix, src_pts, dst_pts = orb
-        src_pts = src_pts.astype(np.float64)
-        dst_pts = dst_pts.astype(np.float64)
-        if analysis != 1.0:
-            src_pts = src_pts / analysis
-            dst_pts = dst_pts / analysis
-            matrix = matrix.copy()
-            matrix[:, 2] = matrix[:, 2] / analysis
-        # 锚点对不齐不能单独否决。窄重叠里孔/元件经常缺或有噪声；
-        # 周期焊盘不进入星座求解，ORB 位姿仍必须通过同一块 C 的内容核对。
-        anchors_ok = _anchors_agree(src_shapes, dst_shapes, matrix)
-        keep = min(40, len(src_pts))
-        point_pairs = [(src_pts[i], dst_pts[i]) for i in range(keep)]
-        anchor_hits = 2 if anchors_ok and src_shapes else 0
-    pose = _pose_from_roi_pairs(point_pairs, inv_local, origin)
-    if pose is None:
-        return None
-    pose = _tighten_vertical(frozen_roi, image, pose, origin, cmask, point_pairs, inv_local)
+        if orb is not None:
+            matrix, src_pts, dst_pts = orb
+            src_pts = src_pts.astype(np.float64)
+            dst_pts = dst_pts.astype(np.float64)
+            if analysis != 1.0:
+                src_pts = src_pts / analysis
+                dst_pts = dst_pts / analysis
+                matrix = matrix.copy()
+                matrix[:, 2] = matrix[:, 2] / analysis
+            # 锚点对不齐不能单独否决。窄重叠里孔/元件经常缺或有噪声；
+            # 周期焊盘不进入星座求解，ORB 位姿仍必须通过同一块 C 的内容核对。
+            anchors_ok = _anchors_agree(src_shapes, dst_shapes, matrix)
+            keep = min(40, len(src_pts))
+            hypotheses.append(
+                (
+                    [(src_pts[i], dst_pts[i]) for i in range(keep)],
+                    2 if anchors_ok and src_shapes else 0,
+                    False,
+                    0.0,
+                )
+            )
     height, width = image.shape[:2]
-    # 形状星座已经锁定时不再做 ECC，避免周期焊盘把位姿吸走。
-    # 只有 ORB 二次测量才允许在同一 C 内做一次小幅 ECC。
-    if not shape_locked:
-        warped = _sample_tile(image, pose, origin, (cmask.shape[1], cmask.shape[0]))
-        correction = _ecc_refine(_gray(frozen_roi), _gray(warped), cmask)
-        if correction is not None:
-            local_pose = pose.copy()
-            local_pose[0, 2] -= float(origin[0])
-            local_pose[1, 2] -= float(origin[1])
-            refined_local = _compose(correction, local_pose)
-            refined = refined_local.copy()
-            refined[0, 2] += float(origin[0])
-            refined[1, 2] += float(origin[1])
-            if _similarity_ok(refined) and _center_shift(refined, rough, width, height) <= _shift_limit(width, height):
-                pose = refined
-    residual = _pair_residual(pose, point_pairs, inv_local, origin)
-    if not _verify_content(
-        frozen_roi,
-        image,
-        pose,
-        origin,
-        cmask,
-        residual,
-        anchor_hits=anchor_hits,
-        sizes_ok=sizes_ok,
-    ):
-        return None
-    # 核对通过之后才看位移。重叠带上大约 20px 的残差要留下；
-    # 从 overlap 猜测修到真实步长（约 100px）也不能在这里丢掉。
-    limit = _shift_limit(width, height) if shape_locked else _verified_shift_limit(width, height)
-    if _center_shift(pose, rough, width, height) > limit:
-        return None
-    return pose
+    best_pose: np.ndarray | None = None
+    best_score = -1.0
+    for point_pairs, anchor_hits, shape_locked, min_ncc in hypotheses:
+        pose = _pose_from_roi_pairs(point_pairs, inv_local, origin)
+        if pose is None:
+            continue
+        # 对边或三角形已经是一次相似变换。只有 ORB 才允许在同一 C 里再做一次完整相似修正。
+        if not shape_locked:
+            warped = _sample_tile(image, pose, origin, (cmask.shape[1], cmask.shape[0]))
+            correction = _ecc_refine(_gray(frozen_roi), _gray(warped), cmask)
+            if correction is not None:
+                local_pose = pose.copy()
+                local_pose[0, 2] -= float(origin[0])
+                local_pose[1, 2] -= float(origin[1])
+                refined_local = _compose(correction, local_pose)
+                refined = refined_local.copy()
+                refined[0, 2] += float(origin[0])
+                refined[1, 2] += float(origin[1])
+                if _similarity_ok(refined) and _center_shift(refined, rough, width, height) <= _shift_limit(width, height):
+                    pose = refined
+        residual = _pair_residual(pose, point_pairs, inv_local, origin)
+        if not _verify_content(
+            frozen_roi,
+            image,
+            pose,
+            origin,
+            cmask,
+            residual,
+            anchor_hits=anchor_hits,
+            sizes_ok=True,
+            min_ncc=min_ncc,
+        ):
+            continue
+        limit = _shift_limit(width, height) if shape_locked else _verified_shift_limit(width, height)
+        if _center_shift(pose, rough, width, height) > limit:
+            continue
+        score = _ncc(
+            _gray(frozen_roi),
+            _gray(_sample_tile(image, pose, origin, (cmask.shape[1], cmask.shape[0]))),
+            cmask,
+        )
+        if best_pose is None or score > best_score:
+            best_score = score
+            best_pose = pose
+    return best_pose
 
 
 def _paste_exclusive(frozen: np.ndarray, cover: np.ndarray, image: np.ndarray, pose: np.ndarray, *, erode: bool) -> None:
@@ -1379,6 +1553,8 @@ def _calibrate_grid(
     """按文件夹顺序冻结。失败的图不写入 frozen/cover，也不改已接受位姿。"""
     if not cells:
         return np.zeros((1, 1, 3), np.uint8), np.zeros((1, 1), np.uint8)
+    for index in range(len(images)):
+        images[index] = _ensure_recognition_frame(images[index])
     max_w = max(int(image.shape[1]) for image in images)
     max_h = max(int(image.shape[0]) for image in images)
     pad_x = int(0.22 * max_w + 12)
@@ -1607,6 +1783,8 @@ def stitch_grid_folder(
             images.append(image)
     if not images:
         raise ValueError("没有可读照片")
+    for index in range(len(images)):
+        images[index] = _ensure_recognition_frame(images[index])
     height, width = images[0].shape[:2]
     if step is None:
         step = (width * (1.0 - overlap), height * (1.0 - overlap))

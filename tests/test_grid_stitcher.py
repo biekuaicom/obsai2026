@@ -266,10 +266,12 @@ def test_image_constellation_not_pulled_by_pad_pitch(tmp_path: Path):
     )
     got = _relative(result.poses[0], result.poses[1])
     error = _max_point_error(got, expected, size[0], size[1])
+    # 识别框裁掉外圈 2px 后，角点误差比整幅坐标略大，但仍远小于一格焊盘或 19px 竖缝。
+    assert abs(float(got[1, 2] - expected[1, 2])) < 5.0
     pitch_shift = expected.copy()
     pitch_shift[0, 2] += 26.0
     snapped = _max_point_error(got, pitch_shift, size[0], size[1])
-    assert error < 4.0, error
+    assert error < 6.0, error
     assert error + 4.0 < snapped
     rotation = abs(matrix_rotation_deg(result.poses[1]) - matrix_rotation_deg(result.poses[0]))
     assert abs(rotation - angle) < 0.6
@@ -387,11 +389,119 @@ def test_match_region_is_intersection_not_full_rectangle():
     assert int(np.count_nonzero(mask)) < 50 * height
 
 
+def test_two_pixel_border_is_excluded_from_frame_and_output(tmp_path: Path):
+    from pcb_ar.core.grid_stitcher import _crop_recognition_frame, _assign_cells, _calibrate_grid
+
+    image = np.full((80, 100, 3), (30, 60, 40), np.uint8)
+    image[:2, :] = (0, 0, 255)
+    image[-2:, :] = (0, 0, 255)
+    image[:, :2] = (0, 0, 255)
+    image[:, -2:] = (0, 0, 255)
+    image[20:40, 20:40] = _INK
+    cropped = _crop_recognition_frame(image)
+    assert cropped.shape[:2] == (76, 96)
+    assert not np.any(cropped[:, :, 2] > 250)
+    cells = _assign_cells(1, 1, 1, 40.0, 40.0, False)
+    frozen, cover = _calibrate_grid(cells, [image.copy()], 40.0, 40.0)
+    ys, xs = np.where(cover > 0)
+    assert int(xs.max() - xs.min() + 1) == 96
+    assert int(ys.max() - ys.min() + 1) == 76
+    assert not np.any((frozen[:, :, 2] > 250) & (frozen[:, :, 0] < 5))
+    result = stitch_grid_folder(_write_tiles(tmp_path, [image]), rows=1, cols=1, step=(40.0, 40.0), max_side=4000)
+    assert result.placed == 1
+    assert result.image.shape[0] == 76 and result.image.shape[1] == 96
+    assert not np.any(result.image[:, :, 2] > 250)
+
+
+def test_nonparallel_edges_solve_pose_in_one_shot():
+    from pcb_ar.core.grid_stitcher import _Edge, _match_mutual_edges
+
+    horizontal = _Edge(np.array([10.0, 20.0]), np.array([110.0, 20.0]))
+    vertical = _Edge(np.array([40.0, 30.0]), np.array([40.0, 120.0]))
+    parallel = _Edge(np.array([10.0, 80.0]), np.array([130.0, 80.0]))
+    angle = math.radians(2.0)
+    rotation = np.array([[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]])
+    shift = np.array([6.0, -8.0])
+
+    def transform(point: np.ndarray) -> np.ndarray:
+        return rotation @ point + shift
+
+    moved_h = _Edge(transform(horizontal.a), transform(horizontal.b))
+    moved_v = _Edge(transform(vertical.a), transform(vertical.b))
+    pairs = _match_mutual_edges([horizontal, vertical], [moved_h, moved_v])
+    assert pairs is not None
+    fitted = _fit_similarity(np.vstack([item[0] for item in pairs]), np.vstack([item[1] for item in pairs]))
+    assert fitted is not None
+    assert abs(matrix_rotation_deg(fitted) - 2.0) < 0.4
+    sample = np.array([50.0, 40.0])
+    assert float(np.linalg.norm(_apply(fitted, sample) - transform(sample))) < 1.5
+    moved_p = _Edge(transform(parallel.a), transform(parallel.b))
+    assert _match_mutual_edges([horizontal, parallel], [moved_h, moved_p]) is None
+
+
+def test_duplicate_shapes_pick_first_unique_in_reading_order():
+    from pcb_ar.core.grid_stitcher import _unique_reference_shapes
+
+    shapes = [
+        _Shape("component", np.array([80.0, 40.0]), 40.0, 20.0, 0.0),
+        _Shape("component", np.array([8.0, 12.0]), 40.0, 20.0, 0.0),
+        _Shape("hole", np.array([50.0, 70.0]), 16.0, 16.0, 0.0),
+        _Shape("component", np.array([18.0, 4.0]), 22.0, 12.0, 0.2),
+        _Shape("pad", np.array([4.0, 1.0]), 6.0, 6.0, 0.0),
+    ]
+    refs = _unique_reference_shapes(shapes)
+    assert refs[0].kind == "component"
+    assert float(refs[0].center[0]) == 18.0
+    assert all(shape.kind != "pad" for shape in refs)
+    assert all(abs(shape.major - 40.0) > 1.0 for shape in refs)
+
+
+def test_periodic_pads_are_not_a_pose_reference():
+    from pcb_ar.core.grid_stitcher import _unique_reference_shapes
+
+    shapes = [_Shape("pad", np.array([10.0 + i * 8.0, 12.0]), 6.0, 6.0, 0.0) for i in range(8)]
+    shapes.append(_Shape("hole", np.array([30.0, 40.0]), 14.0, 14.0, 0.0))
+    refs = _unique_reference_shapes(shapes)
+    assert [shape.kind for shape in refs] == ["hole"]
+
+
+def test_two_neighbors_make_l_shaped_intersection():
+    frozen = np.full((180, 220, 3), (20, 40, 30), np.uint8)
+    cover = np.zeros((180, 220), np.uint8)
+    cover[:160, :100] = 255
+    cover[:50, :] = 255
+    image = np.full((120, 140, 3), (40, 40, 80), np.uint8)
+    cv2.rectangle(image, (20, 16), (90, 48), _INK, -1)
+    rough = np.array([[1.0, 0.0, 70.0], [0.0, 1.0, 20.0]], dtype=np.float64)
+    packed = _roi_intersection(frozen, cover, image, rough)
+    assert packed is not None
+    _frozen_roi, _new_roi, mask, _origin, _local = packed
+    assert int(np.count_nonzero(mask)) < mask.size
+    right_bottom = mask[mask.shape[0] // 2 :, mask.shape[1] // 2 :]
+    assert int(np.count_nonzero(right_bottom)) < right_bottom.size * 0.35
+    assert int(np.count_nonzero(mask[:, : max(1, mask.shape[1] // 4)])) > 0
+    assert int(np.count_nonzero(mask[: max(1, mask.shape[0] // 4), :])) > 0
+
+
+def test_content_verify_rejects_unrelated_pose():
+    from pcb_ar.core.grid_stitcher import _verify_content
+
+    frozen = np.full((80, 90, 3), (30, 80, 40), np.uint8)
+    cv2.rectangle(frozen, (10, 12), (40, 36), _INK, -1)
+    other = np.full((80, 90, 3), (220, 220, 220), np.uint8)
+    cv2.circle(other, (60, 50), 18, (0, 0, 40), -1)
+    mask = np.ones((80, 90), dtype=bool)
+    pose = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    assert _verify_content(frozen, other, pose, (0, 0), mask, 0.4, anchor_hits=2, sizes_ok=True) is False
+
+
 def test_verified_orb_pose_survives_anchor_disagreement(tmp_path, monkeypatch):
     """星座失败时，同一块 C 里核对通过的 ORB 位姿不能被锚点否决丢掉。"""
     import pcb_ar.core.grid_stitcher as gs
 
     monkeypatch.setattr(gs, "_match_constellation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gs, "_match_mutual_edges", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gs, "_match_unique_triangle", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(gs, "_anchors_agree", lambda *_args, **_kwargs: False)
     size = (360, 260)
     origin_a = (24.0, 30.0)
